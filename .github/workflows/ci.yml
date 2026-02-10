@@ -31,3 +31,19 @@ jobs:
 
       - name: Cargo test (release)
         run: cargo test --all --release
+
+  cmake-checks:
+    name: cmake-build-ctest
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure CMake
+        run: cmake -S . -B build
+
+      - name: Build CMake Targets
+        run: cmake --build build -j
+
+      - name: Run CTest
+        run: ctest --test-dir build --output-on-failure

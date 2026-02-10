@@ -1,5 +1,8 @@
 use std::io;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::net::SocketAddr;
+
+#[cfg(all(target_os = "linux", feature = "mmsg"))]
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
 
 use tokio::net::UdpSocket;
 
@@ -436,7 +439,10 @@ fn sockaddr_storage_to_addr(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    #[cfg(all(target_os = "linux", feature = "mmsg"))]
+    use super::{sockaddr_storage_to_addr, socket_addr_to_storage};
+    #[cfg(all(target_os = "linux", feature = "mmsg"))]
+    use std::net::SocketAddr;
 
     #[cfg(all(target_os = "linux", feature = "mmsg"))]
     #[test]

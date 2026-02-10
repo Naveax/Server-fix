@@ -2,16 +2,11 @@ use std::net::SocketAddr;
 
 use anyhow::{bail, Result};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CriticalOverflowPolicy {
+    #[default]
     DropNewest,
     Block,
-}
-
-impl Default for CriticalOverflowPolicy {
-    fn default() -> Self {
-        Self::DropNewest
-    }
 }
 
 #[derive(Debug, Clone)]

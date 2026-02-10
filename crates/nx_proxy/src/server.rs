@@ -7,13 +7,15 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use flume::{Receiver, Sender, TrySendError};
 use nx_metrics::ProxyMetrics;
-use nx_netio::{DatagramRef, MsgBuf, RecvBatchState, SendBatchState};
+use nx_netio::{DatagramRef, MsgBuf};
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::UdpSocket;
 use tokio::task::JoinSet;
 use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
 
+#[cfg(all(feature = "netio_mmsg", target_os = "linux"))]
+use nx_netio::{RecvBatchState, SendBatchState};
 #[cfg(all(feature = "netio_mmsg", target_os = "linux"))]
 use std::os::fd::AsRawFd;
 
@@ -54,6 +56,7 @@ struct InboundPacket {
 
 struct IngressIo {
     bufs: Vec<MsgBuf>,
+    #[cfg(all(feature = "netio_mmsg", target_os = "linux"))]
     recv_state: RecvBatchState,
 }
 
@@ -64,6 +67,7 @@ impl IngressIo {
             .collect::<Vec<_>>();
         Self {
             bufs,
+            #[cfg(all(feature = "netio_mmsg", target_os = "linux"))]
             recv_state: RecvBatchState::new(batch_size.max(1)),
         }
     }
@@ -97,6 +101,9 @@ impl IngressIo {
             }
         }
 
+        #[cfg(not(all(feature = "netio_mmsg", target_os = "linux")))]
+        let _ = metrics;
+
         let n = nx_netio::recv_batch_tokio(socket, &mut self.bufs).await?;
         Ok(self.collect(n))
     }
@@ -114,12 +121,14 @@ impl IngressIo {
 }
 
 struct EgressIo {
+    #[cfg(all(feature = "netio_mmsg", target_os = "linux"))]
     send_state: SendBatchState,
 }
 
 impl EgressIo {
     fn new(batch_size: usize) -> Self {
         Self {
+            #[cfg(all(feature = "netio_mmsg", target_os = "linux"))]
             send_state: SendBatchState::new(batch_size.max(1)),
         }
     }
@@ -159,6 +168,9 @@ impl EgressIo {
                 Err(err) => return Err(err),
             }
         }
+
+        #[cfg(not(all(feature = "netio_mmsg", target_os = "linux")))]
+        let _ = metrics;
 
         let refs = packets
             .iter()

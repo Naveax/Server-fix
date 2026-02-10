@@ -167,6 +167,8 @@ async fn run_session(
     Ok(())
 }
 
+// Read-loop wiring is explicit to keep call sites and ownership boundaries clear.
+#[allow(clippy::too_many_arguments)]
 async fn read_loop<R>(
     mut reader: R,
     critical_tx: Sender<Vec<u8>>,
