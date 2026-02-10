@@ -1,0 +1,13 @@
+[package]
+name = "nx_netio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+mmsg = []
+
+[dependencies]
+tokio.workspace = true
+libc.workspace = true

@@ -1,0 +1,26 @@
+[workspace]
+members = [
+    "crates/nx_metrics",
+    "crates/nx_netio",
+    "crates/nx_proxy",
+    "crates/nx_fbs_guard",
+    "crates/nx_fuzz",
+    "crates/nx_bench",
+]
+default-members = [
+    "crates/nx_metrics",
+    "crates/nx_netio",
+    "crates/nx_proxy",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+version = "0.1.0"
+
+[workspace.dependencies]
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+tokio = { version = "1.43", features = ["macros", "rt-multi-thread", "net", "signal", "time", "sync", "io-util"] }
+libc = "0.2"

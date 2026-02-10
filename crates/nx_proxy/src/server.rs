@@ -1,0 +1,818 @@
+use std::collections::HashMap;
+use std::io;
+use std::net::{SocketAddr, ToSocketAddrs};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use anyhow::{bail, Context, Result};
+use flume::{Receiver, Sender, TrySendError};
+use nx_metrics::ProxyMetrics;
+use nx_netio::{DatagramRef, MsgBuf, RecvBatchState, SendBatchState};
+use socket2::{Domain, Protocol, Socket, Type};
+use tokio::net::UdpSocket;
+use tokio::task::JoinSet;
+use tokio::time::MissedTickBehavior;
+use tokio_util::sync::CancellationToken;
+
+#[cfg(all(feature = "netio_mmsg", target_os = "linux"))]
+use std::os::fd::AsRawFd;
+
+use crate::challenge::{now_unix_secs, ChallengeGate, GateDecision};
+use crate::config::{CriticalOverflowPolicy, ProxyConfig};
+use crate::lane::{classify_lane, TrafficLane};
+use crate::packet::{validate_packet_size, PacketLimits};
+use crate::rate_limit::{MultiScopeRateLimiter, RateLimiterConfig};
+
+#[derive(Debug)]
+struct SessionHandle {
+    critical_tx: Sender<Vec<u8>>,
+    telemetry_tx: Sender<Vec<u8>>,
+    critical_tap_rx: Receiver<Vec<u8>>,
+    telemetry_tap_rx: Receiver<Vec<u8>>,
+    last_seen: Instant,
+}
+
+#[derive(Debug)]
+struct DownstreamPacket {
+    client_addr: SocketAddr,
+    payload: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueueOutcome {
+    Enqueued,
+    Dropped { reason: &'static str },
+    DroppedOldestEnqueued { reason: &'static str },
+    Disconnected,
+}
+
+#[derive(Debug)]
+struct InboundPacket {
+    client_addr: SocketAddr,
+    payload: Vec<u8>,
+}
+
+struct IngressIo {
+    bufs: Vec<MsgBuf>,
+    recv_state: RecvBatchState,
+}
+
+impl IngressIo {
+    fn new(batch_size: usize, max_datagram_bytes: usize) -> Self {
+        let bufs = (0..batch_size.max(1))
+            .map(|_| MsgBuf::with_capacity(max_datagram_bytes.max(1)))
+            .collect::<Vec<_>>();
+        Self {
+            bufs,
+            recv_state: RecvBatchState::new(batch_size.max(1)),
+        }
+    }
+
+    async fn recv(
+        &mut self,
+        socket: &UdpSocket,
+        metrics: &ProxyMetrics,
+    ) -> io::Result<Vec<InboundPacket>> {
+        #[cfg(all(feature = "netio_mmsg", target_os = "linux"))]
+        {
+            loop {
+                match socket.try_io(tokio::io::Interest::READABLE, || {
+                    nx_netio::recv_batch_with_state(
+                        socket.as_raw_fd(),
+                        &mut self.bufs,
+                        &mut self.recv_state,
+                    )
+                }) {
+                    Ok(n) if n > 0 => {
+                        metrics.record_udp_netio_recv_batch(n);
+                        return Ok(self.collect(n));
+                    }
+                    Ok(_) => return Ok(Vec::new()),
+                    Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                        socket.readable().await?;
+                    }
+                    Err(err) if err.kind() == io::ErrorKind::Unsupported => break,
+                    Err(err) => return Err(err),
+                }
+            }
+        }
+
+        let n = nx_netio::recv_batch_tokio(socket, &mut self.bufs).await?;
+        Ok(self.collect(n))
+    }
+
+    fn collect(&self, n: usize) -> Vec<InboundPacket> {
+        let mut out = Vec::with_capacity(n);
+        for msg in self.bufs.iter().take(n) {
+            out.push(InboundPacket {
+                client_addr: msg.addr(),
+                payload: msg.payload().to_vec(),
+            });
+        }
+        out
+    }
+}
+
+struct EgressIo {
+    send_state: SendBatchState,
+}
+
+impl EgressIo {
+    fn new(batch_size: usize) -> Self {
+        Self {
+            send_state: SendBatchState::new(batch_size.max(1)),
+        }
+    }
+
+    async fn send(
+        &mut self,
+        socket: &UdpSocket,
+        packets: &[DownstreamPacket],
+        metrics: &ProxyMetrics,
+    ) -> io::Result<usize> {
+        if packets.is_empty() {
+            return Ok(0);
+        }
+
+        #[cfg(all(feature = "netio_mmsg", target_os = "linux"))]
+        {
+            let refs = packets
+                .iter()
+                .map(|pkt| DatagramRef {
+                    payload: &pkt.payload,
+                    addr: pkt.client_addr,
+                })
+                .collect::<Vec<_>>();
+
+            match nx_netio::send_batch_with_state(socket.as_raw_fd(), &refs, &mut self.send_state) {
+                Ok(sent) => {
+                    metrics.record_udp_netio_send_batch(sent);
+                    if sent < packets.len() {
+                        let tail_refs = refs[sent..].to_vec();
+                        let tail_sent = nx_netio::send_batch_tokio(socket, &tail_refs).await?;
+                        return Ok(sent + tail_sent);
+                    }
+                    return Ok(sent);
+                }
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
+                Err(err) if err.kind() == io::ErrorKind::Unsupported => {}
+                Err(err) => return Err(err),
+            }
+        }
+
+        let refs = packets
+            .iter()
+            .map(|pkt| DatagramRef {
+                payload: &pkt.payload,
+                addr: pkt.client_addr,
+            })
+            .collect::<Vec<_>>();
+        nx_netio::send_batch_tokio(socket, &refs).await
+    }
+}
+
+pub async fn run_proxy(config: ProxyConfig, shutdown: CancellationToken) -> Result<()> {
+    if config.proxy.worker_count > 1 && !config.proxy.reuse_port {
+        bail!("proxy.reuse_port must be true when worker_count > 1");
+    }
+    #[cfg(not(unix))]
+    if config.proxy.worker_count > 1 {
+        bail!("worker sharding with reuse_port requires unix sockets on this build");
+    }
+
+    let metrics = ProxyMetrics::new("nx_proxy")?;
+    let _exporter_thread = if config.metrics.enabled {
+        Some(metrics.spawn_exporter(config.metrics.listen_addr)?)
+    } else {
+        None
+    };
+
+    let listen_addr = config.proxy.listen_addr;
+    let mut workers = JoinSet::new();
+
+    for worker_id in 0..config.proxy.worker_count {
+        let socket = bind_worker_socket(config.proxy.listen_addr, config.proxy.reuse_port)
+            .with_context(|| {
+                format!(
+                    "failed to bind worker {worker_id} socket on {}",
+                    config.proxy.listen_addr
+                )
+            })?;
+
+        let worker_cfg = config.clone();
+        let worker_metrics = metrics.clone();
+        let worker_shutdown = shutdown.child_token();
+        workers.spawn(async move {
+            if let Err(err) = run_worker(
+                worker_id,
+                socket,
+                worker_cfg,
+                worker_metrics,
+                worker_shutdown,
+            )
+            .await
+            {
+                eprintln!("nx_proxy worker {worker_id} error: {err}");
+            }
+        });
+    }
+
+    println!(
+        "nx_proxy listening on {}, upstream {}, workers {}, metrics {}",
+        listen_addr,
+        config.proxy.upstream_addr,
+        config.proxy.worker_count,
+        if config.metrics.enabled {
+            config.metrics.listen_addr.to_string()
+        } else {
+            "disabled".to_string()
+        }
+    );
+
+    shutdown.cancelled().await;
+    shutdown.cancel();
+    while workers.join_next().await.is_some() {}
+
+    Ok(())
+}
+
+async fn run_worker(
+    worker_id: usize,
+    client_socket: UdpSocket,
+    config: ProxyConfig,
+    metrics: ProxyMetrics,
+    shutdown: CancellationToken,
+) -> Result<()> {
+    if config.proxy.pin_workers {
+        let _ = pin_current_thread(worker_id);
+    }
+
+    let client_socket = Arc::new(client_socket);
+    let mut ingress_io = IngressIo::new(config.proxy.batch_size, config.proxy.max_datagram_bytes);
+    let mut rate_limiter = MultiScopeRateLimiter::new(RateLimiterConfig::from(&config.rate_limit));
+    let mut challenge_gate = ChallengeGate::new(&config.cookie);
+    let packet_limits = PacketLimits {
+        min_packet_size: config.proxy.min_datagram_bytes,
+        max_packet_size: config.proxy.max_datagram_bytes,
+    };
+    let telemetry_prefixes = Arc::new(config.proxy.telemetry_prefix_bytes());
+    let critical_queue_capacity = config.proxy.critical_queue_capacity();
+    let telemetry_queue_capacity = config.proxy.telemetry_queue_capacity();
+    let critical_timeout = Duration::from_millis(config.proxy.critical_block_timeout_millis);
+
+    let (downstream_critical_tx, downstream_critical_rx) = flume::bounded(critical_queue_capacity);
+    let downstream_critical_tap = downstream_critical_rx.clone();
+    let (downstream_telemetry_tx, downstream_telemetry_rx) =
+        flume::bounded(telemetry_queue_capacity);
+    let downstream_telemetry_tap = downstream_telemetry_rx.clone();
+
+    let downstream_task = {
+        let socket = Arc::clone(&client_socket);
+        let metrics = metrics.clone();
+        let shutdown = shutdown.child_token();
+        tokio::spawn(async move {
+            run_downstream_worker(
+                socket,
+                downstream_critical_rx,
+                downstream_telemetry_rx,
+                metrics,
+                shutdown,
+                config.proxy.batch_size,
+            )
+            .await
+        })
+    };
+
+    let mut sessions: HashMap<SocketAddr, SessionHandle> = HashMap::new();
+    let idle_timeout = Duration::from_secs(config.rate_limit.idle_timeout_secs.max(1));
+    let mut cleanup_interval = tokio::time::interval(idle_timeout);
+    cleanup_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+    let mut warned_fragment_limitation = false;
+
+    loop {
+        tokio::select! {
+            _ = shutdown.cancelled() => break,
+            _ = cleanup_interval.tick() => {
+                let now = Instant::now();
+                sessions.retain(|_, session| {
+                    let active = !session.critical_tx.is_disconnected() || !session.telemetry_tx.is_disconnected();
+                    active && now.saturating_duration_since(session.last_seen) <= idle_timeout
+                });
+            }
+            recv = ingress_io.recv(&client_socket, &metrics) => {
+                let packets = match recv {
+                    Ok(packets) => packets,
+                    Err(_) => {
+                        metrics.record_udp_drop("udp_recv_error");
+                        metrics.record_drop("client_recv_error");
+                        continue;
+                    }
+                };
+
+                for inbound in packets {
+                    metrics.record_udp_packet_in();
+                    if inbound.payload.is_empty() {
+                        metrics.record_udp_drop("packet_empty");
+                        metrics.record_drop("packet_empty");
+                        continue;
+                    }
+
+                    if inbound.payload.len() > config.proxy.max_datagram_bytes {
+                        metrics.record_udp_drop("packet_too_large");
+                        metrics.record_drop("packet_too_large");
+                        continue;
+                    }
+
+                    if config.proxy.drop_udp_fragments && !warned_fragment_limitation {
+                        // Best-effort note: UDP socket APIs used here do not expose
+                        // reliable inbound IP fragmentation metadata.
+                        warned_fragment_limitation = true;
+                    }
+
+                    let now_secs = now_unix_secs();
+                    let payload = match challenge_gate.evaluate(inbound.client_addr, &inbound.payload, now_secs) {
+                        GateDecision::Forward(payload) => payload,
+                        GateDecision::ForwardVerified(payload) => {
+                            metrics.record_challenge_verified();
+                            payload
+                        }
+                        GateDecision::Challenge(challenge_packet) => {
+                            metrics.record_challenge_issued();
+                            if client_socket.send_to(&challenge_packet, inbound.client_addr).await.is_err() {
+                                metrics.record_udp_drop("cookie_challenge_send_error");
+                                metrics.record_drop("challenge_send_error");
+                            }
+                            continue;
+                        }
+                        GateDecision::Drop(reason) => {
+                            metrics.record_udp_drop(reason);
+                            metrics.record_drop(reason);
+                            continue;
+                        }
+                    };
+
+                    if let Err(reason) = validate_packet_size(payload, packet_limits) {
+                        metrics.record_udp_drop(reason);
+                        metrics.record_drop(reason);
+                        continue;
+                    }
+
+                    if let Err(scope) = rate_limiter.allow(inbound.client_addr.ip(), payload.len()) {
+                        metrics.record_udp_rate_limited(scope.as_label());
+                        metrics.record_udp_drop("udp_rate_limited");
+                        metrics.record_rate_limited();
+                        metrics.record_drop("rate_limited");
+                        continue;
+                    }
+
+                    if !sessions.contains_key(&inbound.client_addr) {
+                        if sessions.len() >= config.proxy.max_sessions {
+                            metrics.record_udp_drop("session_limit_reached");
+                            metrics.record_drop("session_limit_reached");
+                            continue;
+                        }
+
+                        let session = match spawn_session(
+                            inbound.client_addr,
+                            config.proxy.upstream_addr,
+                            critical_queue_capacity,
+                            telemetry_queue_capacity,
+                            config.proxy.critical_overflow_policy,
+                            critical_timeout,
+                            downstream_critical_tx.clone(),
+                            downstream_critical_tap.clone(),
+                            downstream_telemetry_tx.clone(),
+                            downstream_telemetry_tap.clone(),
+                            Arc::clone(&telemetry_prefixes),
+                            metrics.clone(),
+                            shutdown.child_token(),
+                            config.proxy.max_datagram_bytes,
+                        )
+                        .await
+                        {
+                            Ok(session) => session,
+                            Err(_) => {
+                                metrics.record_udp_drop("session_spawn_error");
+                                metrics.record_drop("session_spawn_error");
+                                continue;
+                            }
+                        };
+                        sessions.insert(inbound.client_addr, session);
+                    }
+
+                    let Some(session) = sessions.get_mut(&inbound.client_addr) else {
+                        metrics.record_udp_drop("session_lookup_error");
+                        metrics.record_drop("session_lookup_error");
+                        continue;
+                    };
+                    session.last_seen = Instant::now();
+
+                    let lane = classify_lane(payload, &telemetry_prefixes);
+                    let queue_result = enqueue_laned(
+                        payload.to_vec(),
+                        lane,
+                        &session.critical_tx,
+                        &session.critical_tap_rx,
+                        &session.telemetry_tx,
+                        &session.telemetry_tap_rx,
+                        config.proxy.critical_overflow_policy,
+                        critical_timeout,
+                        &metrics,
+                        "client_to_upstream",
+                    )
+                    .await;
+
+                    handle_queue_outcome(&metrics, queue_result, "client_to_upstream");
+                }
+            }
+        }
+    }
+
+    shutdown.cancel();
+    sessions.clear();
+    let _ = downstream_task.await;
+    Ok(())
+}
+
+fn handle_queue_outcome(metrics: &ProxyMetrics, outcome: QueueOutcome, direction: &'static str) {
+    match outcome {
+        QueueOutcome::Enqueued => {}
+        QueueOutcome::Dropped { reason } => {
+            metrics.record_udp_drop(reason);
+            metrics.record_drop(reason);
+            metrics.record_queue_full(direction);
+        }
+        QueueOutcome::DroppedOldestEnqueued { reason } => {
+            metrics.record_udp_drop(reason);
+            metrics.record_drop(reason);
+            metrics.record_queue_full(direction);
+        }
+        QueueOutcome::Disconnected => {
+            metrics.record_udp_drop("queue_disconnected");
+            metrics.record_drop("queue_disconnected");
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn spawn_session(
+    client_addr: SocketAddr,
+    upstream_addr: SocketAddr,
+    critical_queue_capacity: usize,
+    telemetry_queue_capacity: usize,
+    critical_policy: CriticalOverflowPolicy,
+    critical_timeout: Duration,
+    downstream_critical_tx: Sender<DownstreamPacket>,
+    downstream_critical_tap: Receiver<DownstreamPacket>,
+    downstream_telemetry_tx: Sender<DownstreamPacket>,
+    downstream_telemetry_tap: Receiver<DownstreamPacket>,
+    telemetry_prefixes: Arc<Vec<Vec<u8>>>,
+    metrics: ProxyMetrics,
+    shutdown: CancellationToken,
+    max_datagram_bytes: usize,
+) -> Result<SessionHandle> {
+    let bind_addr = match upstream_addr {
+        SocketAddr::V4(_) => "0.0.0.0:0",
+        SocketAddr::V6(_) => "[::]:0",
+    };
+
+    let bind_addr = bind_addr
+        .to_socket_addrs()
+        .context("invalid bind address")?
+        .next()
+        .context("no bind address resolved")?;
+
+    let upstream_socket = UdpSocket::bind(bind_addr)
+        .await
+        .context("failed to bind upstream session socket")?;
+    upstream_socket
+        .connect(upstream_addr)
+        .await
+        .context("failed to connect upstream session socket")?;
+
+    let (critical_tx, critical_rx) = flume::bounded(critical_queue_capacity);
+    let critical_tap_rx = critical_rx.clone();
+    let (telemetry_tx, telemetry_rx) = flume::bounded(telemetry_queue_capacity);
+    let telemetry_tap_rx = telemetry_rx.clone();
+
+    tokio::spawn(run_session_worker(
+        client_addr,
+        upstream_socket,
+        critical_rx,
+        telemetry_rx,
+        downstream_critical_tx,
+        downstream_critical_tap,
+        downstream_telemetry_tx,
+        downstream_telemetry_tap,
+        telemetry_prefixes,
+        critical_policy,
+        critical_timeout,
+        metrics,
+        shutdown,
+        max_datagram_bytes,
+    ));
+
+    Ok(SessionHandle {
+        critical_tx,
+        telemetry_tx,
+        critical_tap_rx,
+        telemetry_tap_rx,
+        last_seen: Instant::now(),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_session_worker(
+    client_addr: SocketAddr,
+    upstream_socket: UdpSocket,
+    critical_rx: Receiver<Vec<u8>>,
+    telemetry_rx: Receiver<Vec<u8>>,
+    downstream_critical_tx: Sender<DownstreamPacket>,
+    downstream_critical_tap: Receiver<DownstreamPacket>,
+    downstream_telemetry_tx: Sender<DownstreamPacket>,
+    downstream_telemetry_tap: Receiver<DownstreamPacket>,
+    telemetry_prefixes: Arc<Vec<Vec<u8>>>,
+    critical_policy: CriticalOverflowPolicy,
+    critical_timeout: Duration,
+    metrics: ProxyMetrics,
+    shutdown: CancellationToken,
+    max_datagram_bytes: usize,
+) {
+    let mut recv_buf = vec![0u8; max_datagram_bytes.max(1)];
+
+    loop {
+        tokio::select! {
+            _ = shutdown.cancelled() => break,
+            outbound = recv_prioritized(&critical_rx, &telemetry_rx, &shutdown) => {
+                let Some(payload) = outbound else {
+                    break;
+                };
+
+                metrics.set_udp_queue_depth("client_to_upstream", "critical", critical_rx.len() as i64);
+                metrics.set_udp_queue_depth("client_to_upstream", "telemetry", telemetry_rx.len() as i64);
+
+                match upstream_socket.send(&payload).await {
+                    Ok(_) => {
+                        metrics.record_udp_packet_forwarded();
+                        metrics.record_forwarded("client_to_upstream");
+                    }
+                    Err(_) => {
+                        metrics.record_udp_drop("upstream_send_error");
+                        metrics.record_drop("upstream_send_error");
+                        break;
+                    }
+                }
+            }
+            recv = upstream_socket.recv(&mut recv_buf) => {
+                let len = match recv {
+                    Ok(len) => len,
+                    Err(_) => {
+                        metrics.record_udp_drop("upstream_recv_error");
+                        metrics.record_drop("upstream_recv_error");
+                        break;
+                    }
+                };
+
+                if len == 0 {
+                    metrics.record_udp_drop("upstream_packet_empty");
+                    metrics.record_drop("upstream_packet_empty");
+                    continue;
+                }
+
+                let payload = recv_buf[..len].to_vec();
+                let lane = classify_lane(&payload, &telemetry_prefixes);
+                let packet = DownstreamPacket { client_addr, payload };
+
+                let queue_result = enqueue_laned(
+                    packet,
+                    lane,
+                    &downstream_critical_tx,
+                    &downstream_critical_tap,
+                    &downstream_telemetry_tx,
+                    &downstream_telemetry_tap,
+                    critical_policy,
+                    critical_timeout,
+                    &metrics,
+                    "upstream_to_client",
+                ).await;
+
+                handle_queue_outcome(&metrics, queue_result, "upstream_to_client");
+                if matches!(queue_result, QueueOutcome::Disconnected) {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+async fn run_downstream_worker(
+    client_socket: Arc<UdpSocket>,
+    critical_rx: Receiver<DownstreamPacket>,
+    telemetry_rx: Receiver<DownstreamPacket>,
+    metrics: ProxyMetrics,
+    shutdown: CancellationToken,
+    batch_size: usize,
+) {
+    let mut egress_io = EgressIo::new(batch_size.max(1));
+
+    loop {
+        let Some(first) = recv_prioritized(&critical_rx, &telemetry_rx, &shutdown).await else {
+            break;
+        };
+
+        let mut batch = Vec::with_capacity(batch_size.max(1));
+        batch.push(first);
+        while batch.len() < batch.capacity() {
+            if let Ok(packet) = critical_rx.try_recv() {
+                batch.push(packet);
+                continue;
+            }
+            if let Ok(packet) = telemetry_rx.try_recv() {
+                batch.push(packet);
+                continue;
+            }
+            break;
+        }
+
+        metrics.set_udp_queue_depth("upstream_to_client", "critical", critical_rx.len() as i64);
+        metrics.set_udp_queue_depth("upstream_to_client", "telemetry", telemetry_rx.len() as i64);
+
+        match egress_io.send(&client_socket, &batch, &metrics).await {
+            Ok(sent) => {
+                for _ in 0..sent {
+                    metrics.record_udp_packet_forwarded();
+                    metrics.record_forwarded("upstream_to_client");
+                }
+            }
+            Err(_) => {
+                metrics.record_udp_drop("client_send_error");
+                metrics.record_drop("client_send_error");
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn enqueue_laned<T>(
+    item: T,
+    lane: TrafficLane,
+    critical_tx: &Sender<T>,
+    critical_tap_rx: &Receiver<T>,
+    telemetry_tx: &Sender<T>,
+    telemetry_tap_rx: &Receiver<T>,
+    critical_policy: CriticalOverflowPolicy,
+    critical_timeout: Duration,
+    metrics: &ProxyMetrics,
+    direction: &'static str,
+) -> QueueOutcome {
+    let outcome = match lane {
+        TrafficLane::Telemetry => match telemetry_tx.try_send(item) {
+            Ok(_) => QueueOutcome::Enqueued,
+            Err(TrySendError::Disconnected(_)) => QueueOutcome::Disconnected,
+            Err(TrySendError::Full(item)) => {
+                let _ = telemetry_tap_rx.try_recv();
+                match telemetry_tx.try_send(item) {
+                    Ok(_) => QueueOutcome::DroppedOldestEnqueued {
+                        reason: "queue_full_telemetry",
+                    },
+                    Err(TrySendError::Full(_)) => QueueOutcome::Dropped {
+                        reason: "queue_full_telemetry",
+                    },
+                    Err(TrySendError::Disconnected(_)) => QueueOutcome::Disconnected,
+                }
+            }
+        },
+        TrafficLane::Critical => match critical_policy {
+            CriticalOverflowPolicy::DropNewest => match critical_tx.try_send(item) {
+                Ok(_) => QueueOutcome::Enqueued,
+                Err(TrySendError::Disconnected(_)) => QueueOutcome::Disconnected,
+                Err(TrySendError::Full(_)) => QueueOutcome::Dropped {
+                    reason: "queue_full_critical",
+                },
+            },
+            CriticalOverflowPolicy::BlockWithTimeout => {
+                match tokio::time::timeout(critical_timeout, critical_tx.send_async(item)).await {
+                    Ok(Ok(_)) => QueueOutcome::Enqueued,
+                    Ok(Err(_)) => QueueOutcome::Disconnected,
+                    Err(_) => QueueOutcome::Dropped {
+                        reason: "queue_full_critical_timeout",
+                    },
+                }
+            }
+        },
+    };
+
+    metrics.set_udp_queue_depth(direction, "critical", critical_tap_rx.len() as i64);
+    metrics.set_udp_queue_depth(direction, "telemetry", telemetry_tap_rx.len() as i64);
+    outcome
+}
+
+async fn recv_prioritized<T: Send + 'static>(
+    critical_rx: &Receiver<T>,
+    telemetry_rx: &Receiver<T>,
+    shutdown: &CancellationToken,
+) -> Option<T> {
+    loop {
+        if let Ok(item) = critical_rx.try_recv() {
+            return Some(item);
+        }
+
+        if critical_rx.is_disconnected() && telemetry_rx.is_disconnected() {
+            return None;
+        }
+
+        tokio::select! {
+            _ = shutdown.cancelled() => return None,
+            recv = critical_rx.recv_async() => {
+                match recv {
+                    Ok(item) => return Some(item),
+                    Err(_) => {
+                        if telemetry_rx.is_disconnected() {
+                            return None;
+                        }
+                    }
+                }
+            }
+            recv = telemetry_rx.recv_async() => {
+                match recv {
+                    Ok(item) => return Some(item),
+                    Err(_) => {
+                        if critical_rx.is_disconnected() {
+                            return None;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn bind_worker_socket(listen_addr: SocketAddr, reuse_port: bool) -> Result<UdpSocket> {
+    let domain = if listen_addr.is_ipv4() {
+        Domain::IPV4
+    } else {
+        Domain::IPV6
+    };
+    let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))
+        .context("failed creating UDP socket")?;
+    socket
+        .set_reuse_address(true)
+        .context("failed setting SO_REUSEADDR")?;
+
+    #[cfg(unix)]
+    if reuse_port {
+        socket
+            .set_reuse_port(true)
+            .context("failed setting SO_REUSEPORT")?;
+    }
+
+    #[cfg(not(unix))]
+    if reuse_port {
+        let _ = reuse_port;
+    }
+
+    socket
+        .bind(&listen_addr.into())
+        .with_context(|| format!("failed binding UDP socket to {listen_addr}"))?;
+    socket
+        .set_nonblocking(true)
+        .context("failed setting nonblocking mode")?;
+
+    let std_socket: std::net::UdpSocket = socket.into();
+    UdpSocket::from_std(std_socket).context("failed converting socket into tokio UdpSocket")
+}
+
+#[cfg(target_os = "linux")]
+fn pin_current_thread(worker_id: usize) -> io::Result<()> {
+    let cpu_count = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .max(1);
+    let cpu = worker_id % cpu_count;
+    let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+    unsafe {
+        libc::CPU_ZERO(&mut set);
+        libc::CPU_SET(cpu, &mut set);
+    }
+    let rc = unsafe {
+        libc::sched_setaffinity(
+            0,
+            std::mem::size_of::<libc::cpu_set_t>(),
+            &set as *const libc::cpu_set_t,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn pin_current_thread(_worker_id: usize) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "cpu pinning is only available on linux",
+    ))
+}

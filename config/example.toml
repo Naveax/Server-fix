@@ -1,0 +1,52 @@
+[proxy]
+listen_addr = "0.0.0.0:7000"
+upstream_addr = "10.0.0.10:7001"
+worker_count = 4
+reuse_port = true
+pin_workers = false
+batch_size = 64
+max_sessions = 65536
+min_datagram_bytes = 1
+max_datagram_bytes = 1400
+drop_udp_fragments = true
+# best-effort: exact fragment detection may not be available via standard UDP socket APIs
+queue_capacity = 512
+telemetry_queue_capacity = 512
+critical_queue_capacity = 256
+critical_overflow_policy = "drop_newest"
+critical_block_timeout_millis = 5
+telemetry_prefixes = ["TELE:", "STAT:"]
+
+[rate_limit]
+per_ip_packets_per_second = 800.0
+per_ip_burst_packets = 1600.0
+per_ip_bytes_per_second = 800000.0
+per_ip_burst_bytes = 1600000.0
+global_packets_per_second = 50000.0
+global_burst_packets = 100000.0
+global_bytes_per_second = 256000000.0
+global_burst_bytes = 512000000.0
+subnet_enabled = true
+subnet_ipv4_prefix = 24
+subnet_ipv6_prefix = 64
+subnet_packets_per_second = 20000.0
+subnet_burst_packets = 40000.0
+subnet_bytes_per_second = 128000000.0
+subnet_burst_bytes = 256000000.0
+max_ip_buckets = 65536
+max_subnet_buckets = 16384
+idle_timeout_secs = 120
+
+[cookie]
+enabled = true
+mode = "compat"
+secret = "replace-with-strong-secret"
+token_ttl_secs = 20
+tag_bytes = 16
+max_tracked_peers = 65536
+challenge_packets_per_second = 5000.0
+challenge_burst_packets = 10000.0
+
+[metrics]
+enabled = true
+listen_addr = "0.0.0.0:9100"

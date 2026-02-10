@@ -1,0 +1,28 @@
+{
+  "version": 3,
+  "configurePresets": [
+    {
+      "name": "default",
+      "displayName": "Default",
+      "generator": "Unix Makefiles",
+      "binaryDir": "${sourceDir}/build",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "GUARD_BUILD_TESTS": "ON",
+        "GUARD_ENABLE_SANDBOX": "ON"
+      }
+    },
+    {
+      "name": "fuzz",
+      "displayName": "Fuzz",
+      "generator": "Unix Makefiles",
+      "binaryDir": "${sourceDir}/build-fuzz",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "GUARD_BUILD_TESTS": "OFF",
+        "GUARD_FUZZ": "ON",
+        "GUARD_ENABLE_SANDBOX": "ON"
+      }
+    }
+  ]
+}

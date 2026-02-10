@@ -1,0 +1,10 @@
+[package]
+name = "nx_metrics"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+prometheus = "0.13"
+tiny_http = "0.12"
+thiserror = "1.0"

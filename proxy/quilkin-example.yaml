@@ -1,0 +1,15 @@
+# Quilkin-style UDP proxy filter chain (example)
+filters:
+  - name: admission
+    config:
+      allow_ports: ["udp:7000-7100"]
+  - name: rate_limit
+    config:
+      pps: 500
+      bps: 500000
+  - name: metrics
+    config:
+      export: prometheus
+  - name: routing
+    config:
+      target: "game-server-pool"

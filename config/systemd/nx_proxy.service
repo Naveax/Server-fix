@@ -1,0 +1,19 @@
+[Unit]
+Description=nx_proxy UDP edge mitigation service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=nxproxy
+Group=nxproxy
+WorkingDirectory=/opt/rocketleagueserverfix
+ExecStart=/opt/rocketleagueserverfix/nx_proxy --config /etc/nx_proxy/example.toml
+Restart=always
+RestartSec=1
+LimitNOFILE=1048576
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

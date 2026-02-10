@@ -1,0 +1,17 @@
+[package]
+name = "nx_fbs_guard"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+tokio.workspace = true
+tokio-util = "0.7"
+clap = { version = "4.5", features = ["derive"] }
+flume = { version = "0.11", default-features = false, features = ["async"] }
+thiserror = "1.0"
+nx_metrics = { path = "../nx_metrics" }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

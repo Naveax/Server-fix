@@ -1,0 +1,17 @@
+/target
+**/*.rs.bk
+crates/nx_fuzz/corpus/
+crates/nx_fuzz/artifacts/
+
+# CMake / build outputs
+/build/
+/build-*/
+/CMakeFiles/
+/**/CMakeFiles/
+/**/CMakeCache.txt
+/**/*.o
+/**/*.a
+/**/*.so
+/**/*.dll
+/**/*.exe
+/**/a.out

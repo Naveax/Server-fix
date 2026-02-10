@@ -1,0 +1,42 @@
+[package]
+name = "nx_fuzz"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+nx_proxy = { path = "../nx_proxy" }
+nx_fbs_guard = { path = "../nx_fbs_guard" }
+
+[[bin]]
+name = "frame_decoder"
+path = "fuzz_targets/frame_decoder.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "validator"
+path = "fuzz_targets/validator.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fbs_guard_decoder"
+path = "fuzz_targets/fbs_guard_decoder.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "udp_datagram_validator"
+path = "fuzz_targets/udp_datagram_validator.rs"
+test = false
+doc = false
+bench = false

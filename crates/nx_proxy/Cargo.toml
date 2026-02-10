@@ -1,0 +1,42 @@
+[package]
+name = "nx_proxy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+autobins = false
+
+[lib]
+name = "nx_proxy"
+path = "src/lib.rs"
+
+[[bin]]
+name = "nx_proxy"
+path = "src/main.rs"
+
+[[bin]]
+name = "nx_echo_upstream"
+path = "src/bin/nx_echo_upstream.rs"
+
+[features]
+default = ["netio_mmsg"]
+netio_mmsg = ["nx_netio/mmsg"]
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+tokio.workspace = true
+clap = { version = "4.5", features = ["derive"] }
+flume = { version = "0.11", default-features = false, features = ["async"] }
+hmac = "0.12"
+sha2 = "0.10"
+rand = "0.8"
+toml = "0.8"
+tokio-util = "0.7"
+socket2 = { version = "0.5", features = ["all"] }
+libc.workspace = true
+nx_metrics = { path = "../nx_metrics" }
+nx_netio = { path = "../nx_netio", default-features = false }
+
+[dev-dependencies]
+tempfile = "3.15"
