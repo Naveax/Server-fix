@@ -6,7 +6,8 @@ use nx_proxy::anomaly::AnomalyDetector;
 use nx_proxy::challenge::build_response_packet_from_challenge;
 use nx_proxy::config::{
     AnomalySection, CookieMode, CookieSection, CriticalOverflowPolicy, FloodSimSection,
-    MetricsSection, ProxyConfig, ProxySection, RateLimitSection,
+    MetricsSection, MmrSection, PacketValidationSection, ProxyConfig, ProxySection,
+    RateLimitSection,
 };
 use nx_proxy::packet::{cookie_header_len, COOKIE_MAGIC};
 use nx_proxy::run_proxy;
@@ -334,6 +335,8 @@ fn base_config(
             challenge_burst_packets: 1000.0,
         },
         anomaly: AnomalySection::default(),
+        packet_validation: PacketValidationSection::default(),
+        mmr: MmrSection::default(),
         flood_sim: FloodSimSection::default(),
         metrics: MetricsSection {
             enabled: true,

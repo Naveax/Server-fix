@@ -2,6 +2,7 @@ pub mod anomaly;
 pub mod challenge;
 pub mod config;
 pub mod lane;
+pub mod mmr;
 pub mod packet;
 pub mod rate_limit;
 pub mod server;

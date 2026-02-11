@@ -7,7 +7,7 @@ use tokio_util::sync::CancellationToken;
 #[derive(Debug, Parser)]
 #[command(name = "nx_proxy")]
 #[command(
-    about = "Defensive UDP mitigation proxy with per-IP token buckets, backpressure, and anomaly filtering"
+    about = "Defensive UDP mitigation proxy with strict packet validation, anomaly filtering, and smurf/MMR detection"
 )]
 struct Args {
     #[arg(long, default_value = "config/dev.toml")]
