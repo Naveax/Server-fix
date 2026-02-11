@@ -5,6 +5,11 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
+[features]
+default = []
+cuda_anomaly = ["nx_proxy/cuda_anomaly"]
+cuda_anomaly_torch = ["cuda_anomaly", "nx_proxy/torch_anomaly"]
+
 [dependencies]
 nx_netio = { path = "../nx_netio", default-features = false, features = ["mmsg"] }
 nx_proxy = { path = "../nx_proxy", default-features = false }

@@ -10,6 +10,14 @@ use tch::{CModule, Device, Kind, Tensor};
 
 const MIN_ELAPSED_SECS: f64 = 1e-3;
 const TORCH_SEQUENCE_LEN: usize = 10;
+#[cfg(all(feature = "torch_anomaly", not(debug_assertions)))]
+const TORCH_INPUT_FEATURES: usize = 3;
+#[cfg(all(feature = "torch_anomaly", not(debug_assertions)))]
+const PACKET_COUNT_SCALE: f32 = 1_024.0;
+#[cfg(all(feature = "torch_anomaly", not(debug_assertions)))]
+const SIZE_AVG_SCALE: f32 = 1_500.0;
+#[cfg(all(feature = "torch_anomaly", not(debug_assertions)))]
+const DELTA_SCALE: f32 = 1_024.0;
 
 #[derive(Debug, Clone)]
 struct RuntimeConfig {
@@ -286,12 +294,30 @@ impl AnomalyDetector {
         self.should_drop_at(source_ip, packet_len, now)
     }
 
+    pub fn check_anomaly_score(
+        &mut self,
+        source_ip: IpAddr,
+        packet_len: usize,
+        now: Instant,
+    ) -> Option<f32> {
+        self.score_at(source_ip, packet_len, now)
+    }
+
     pub(crate) fn should_drop_at(
         &mut self,
         source_ip: IpAddr,
         packet_len: usize,
         now: Instant,
     ) -> Option<f32> {
+        let score = self.score_at(source_ip, packet_len, now)?;
+        if score >= self.cfg.threshold {
+            Some(score)
+        } else {
+            None
+        }
+    }
+
+    fn score_at(&mut self, source_ip: IpAddr, packet_len: usize, now: Instant) -> Option<f32> {
         if !self.cfg.enabled {
             return None;
         }
@@ -309,12 +335,7 @@ impl AnomalyDetector {
             return None;
         }
 
-        let score = self.score_features(features, &sequence);
-        if score >= self.cfg.threshold {
-            Some(score)
-        } else {
-            None
-        }
+        Some(self.score_features(features, &sequence))
     }
 
     fn score_features(&self, features: [f32; 3], sequence: &[[f32; 3]]) -> f32 {
@@ -365,11 +386,9 @@ struct TorchRuntime {
 impl TorchRuntime {
     fn try_load(path: &str) -> Option<Self> {
         let path_ref = Path::new(path);
-        match CModule::load_on_device(path_ref, Device::Cpu) {
-            Ok(module) => Some(Self {
-                module,
-                device: Device::Cpu,
-            }),
+        let device = preferred_torch_device();
+        match CModule::load_on_device(path_ref, device) {
+            Ok(module) => Some(Self { module, device }),
             Err(err) => {
                 eprintln!(
                     "nx_proxy anomaly torch model load failed for {}: {}",
@@ -382,13 +401,14 @@ impl TorchRuntime {
     }
 
     fn infer_score(&self, sequence: &[[f32; 3]]) -> Option<f32> {
-        let mut flat = vec![0.0_f32; TORCH_SEQUENCE_LEN * 3];
+        let mut flat = vec![0.0_f32; TORCH_SEQUENCE_LEN * TORCH_INPUT_FEATURES];
         let take = sequence.len().min(TORCH_SEQUENCE_LEN);
         let start = TORCH_SEQUENCE_LEN.saturating_sub(take);
         let tail = &sequence[sequence.len().saturating_sub(take)..];
         for (i, step) in tail.iter().enumerate() {
-            let base = (start + i) * 3;
-            flat[base..base + 3].copy_from_slice(step);
+            let base = (start + i) * TORCH_INPUT_FEATURES;
+            let normalized = normalize_sequence_step(*step);
+            flat[base..base + TORCH_INPUT_FEATURES].copy_from_slice(&normalized);
         }
 
         // Expected TorchScript input for LSTM/autoencoder style models: [batch=1, seq=10, feat=3].
@@ -396,7 +416,7 @@ impl TorchRuntime {
             .ok()?
             .to_device(self.device)
             .to_kind(Kind::Float)
-            .reshape([1, TORCH_SEQUENCE_LEN as i64, 3]);
+            .reshape([1, TORCH_SEQUENCE_LEN as i64, TORCH_INPUT_FEATURES as i64]);
         let output = self.module.forward_ts(&[input]).ok()?;
 
         let flat_output = output.flatten(0, -1).to_kind(Kind::Float);
@@ -404,14 +424,61 @@ impl TorchRuntime {
             return None;
         }
         let score = if flat_output.numel() == 1 {
-            flat_output.sigmoid().double_value(&[0]) as f32
+            let raw = flat_output.double_value(&[0]) as f32;
+            if !raw.is_finite() {
+                return None;
+            }
+            if (0.0..=1.0).contains(&raw) {
+                raw
+            } else {
+                logistic_score(raw)
+            }
         } else {
             // Autoencoder-style fallback: map reconstruction magnitude to [0, 1].
             let recon = flat_output.abs().mean(Kind::Float).double_value(&[]) as f32;
+            if !recon.is_finite() {
+                return None;
+            }
             (1.0 - (-recon).exp()).clamp(0.0, 1.0)
         };
         Some(score.clamp(0.0, 1.0))
     }
+}
+
+#[cfg(all(
+    feature = "torch_anomaly",
+    not(debug_assertions),
+    feature = "cuda_anomaly"
+))]
+fn preferred_torch_device() -> Device {
+    if tch::Cuda::is_available() {
+        Device::Cuda(0)
+    } else {
+        Device::Cpu
+    }
+}
+
+#[cfg(all(
+    feature = "torch_anomaly",
+    not(debug_assertions),
+    not(feature = "cuda_anomaly")
+))]
+fn preferred_torch_device() -> Device {
+    Device::Cpu
+}
+
+#[cfg(all(feature = "torch_anomaly", not(debug_assertions)))]
+fn normalize_sequence_step(step: [f32; 3]) -> [f32; 3] {
+    [
+        (step[0] / PACKET_COUNT_SCALE).clamp(0.0, 8.0),
+        (step[1] / SIZE_AVG_SCALE).clamp(0.0, 2.0),
+        (step[2] / DELTA_SCALE).clamp(-8.0, 8.0),
+    ]
+}
+
+#[cfg(all(feature = "torch_anomaly", not(debug_assertions)))]
+fn logistic_score(v: f32) -> f32 {
+    1.0 / (1.0 + (-v).exp())
 }
 
 #[cfg(test)]

@@ -1,7 +1,13 @@
 /target
+anomaly_model.pt
+*.pt
 **/*.rs.bk
 crates/nx_fuzz/corpus/
 crates/nx_fuzz/artifacts/
+/corpus/
+/fuzz/
+/fuzz_runs/
+/fuzz-*.log
 
 # CMake / build outputs
 /build/
@@ -15,3 +21,4 @@ crates/nx_fuzz/artifacts/
 /**/*.dll
 /**/*.exe
 /**/a.out
+/CMakeLists.txt.bak.*

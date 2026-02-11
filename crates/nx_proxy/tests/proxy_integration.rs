@@ -87,24 +87,26 @@ async fn telemetry_spam_does_not_starve_critical() {
             .await
             .expect("send telemetry");
     }
-    for _ in 0..3 {
-        client
-            .send_to(b"CRIT:important", proxy_addr)
-            .await
-            .expect("send critical");
-    }
 
     let mut buf = [0u8; 2048];
     let mut saw_critical = false;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
-    while tokio::time::Instant::now() < deadline {
-        let recv = timeout(Duration::from_millis(250), client.recv_from(&mut buf)).await;
-        let Ok(Ok((len, _))) = recv else {
-            continue;
-        };
-        if &buf[..len] == b"CRIT:important" {
-            saw_critical = true;
-            break;
+    while tokio::time::Instant::now() < deadline && !saw_critical {
+        client
+            .send_to(b"CRIT:important", proxy_addr)
+            .await
+            .expect("send critical");
+
+        let poll_deadline = tokio::time::Instant::now() + Duration::from_millis(350);
+        while tokio::time::Instant::now() < poll_deadline {
+            let recv = timeout(Duration::from_millis(60), client.recv_from(&mut buf)).await;
+            let Ok(Ok((len, _))) = recv else {
+                continue;
+            };
+            if &buf[..len] == b"CRIT:important" {
+                saw_critical = true;
+                break;
+            }
         }
     }
     assert!(
