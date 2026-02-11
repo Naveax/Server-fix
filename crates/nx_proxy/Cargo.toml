@@ -31,6 +31,10 @@ name = "nx_rl_sim"
 path = "src/bin/nx_rl_sim.rs"
 
 [[bin]]
+name = "nx_eos_sim"
+path = "src/bin/nx_eos_sim.rs"
+
+[[bin]]
 name = "train"
 path = "src/bin/train.rs"
 required-features = ["torch_train_backend"]
