@@ -23,7 +23,8 @@ use crate::anomaly::AnomalyDetector;
 use crate::challenge::{now_unix_secs, ChallengeGate, GateDecision};
 use crate::config::{CriticalOverflowPolicy, ProxyConfig};
 use crate::lane::{classify_lane, TrafficLane};
-use crate::packet::{validate_packet_size, PacketLimits};
+use crate::mmr::MmrDetector;
+use crate::packet::{validate_packet, PacketLimits, PacketValidationPolicy, CHECKSUM_HEADER_LEN};
 use crate::rate_limit::{MultiScopeRateLimiter, RateLimiterConfig};
 
 #[derive(Debug)]
@@ -264,11 +265,24 @@ async fn run_worker(
     let mut ingress_io = IngressIo::new(config.proxy.batch_size, config.proxy.max_datagram_bytes);
     let mut rate_limiter = MultiScopeRateLimiter::new(RateLimiterConfig::from(&config.rate_limit));
     let mut anomaly_detector = AnomalyDetector::new(&config.anomaly, &config.rate_limit);
+    let mut mmr_detector = MmrDetector::new(&config.mmr);
     let mut challenge_gate = ChallengeGate::new(&config.cookie);
     let packet_limits = PacketLimits {
         min_packet_size: config.proxy.min_datagram_bytes,
         max_packet_size: config.proxy.max_datagram_bytes,
     };
+    let packet_validation = PacketValidationPolicy {
+        enabled: config.packet_validation.enabled,
+        strict_mode: config.packet_validation.strict_mode,
+        require_checksum: config.packet_validation.require_checksum,
+        strip_checksum_header: config.packet_validation.strip_checksum_header,
+    };
+    let max_wire_packet_size = config.proxy.max_datagram_bytes
+        + if packet_validation.enabled && packet_validation.require_checksum {
+            CHECKSUM_HEADER_LEN
+        } else {
+            0
+        };
     let telemetry_prefixes = Arc::new(config.proxy.telemetry_prefix_bytes());
     let critical_queue_capacity = config.proxy.critical_queue_capacity();
     let telemetry_queue_capacity = config.proxy.telemetry_queue_capacity();
@@ -332,7 +346,7 @@ async fn run_worker(
                         continue;
                     }
 
-                    if inbound.payload.len() > config.proxy.max_datagram_bytes {
+                    if inbound.payload.len() > max_wire_packet_size {
                         metrics.record_udp_drop("packet_too_large");
                         metrics.record_drop("packet_too_large");
                         continue;
@@ -366,11 +380,14 @@ async fn run_worker(
                         }
                     };
 
-                    if let Err(reason) = validate_packet_size(payload, packet_limits) {
-                        metrics.record_udp_drop(reason);
-                        metrics.record_drop(reason);
-                        continue;
-                    }
+                    let payload = match validate_packet(payload, packet_limits, packet_validation) {
+                        Ok(payload) => payload,
+                        Err(reason) => {
+                            metrics.record_udp_drop(reason);
+                            metrics.record_drop(reason);
+                            continue;
+                        }
+                    };
 
                     if let Err(scope) = rate_limiter.allow(inbound.client_addr.ip(), payload.len()) {
                         metrics.record_udp_rate_limited(scope.as_label());
@@ -381,13 +398,24 @@ async fn run_worker(
                         continue;
                     }
 
+                    let now = Instant::now();
+
                     if anomaly_detector
-                        .should_drop(inbound.client_addr.ip(), payload.len())
+                        .check_anomaly_with_payload(inbound.client_addr.ip(), payload, now)
                         .is_some()
                     {
                         metrics.record_udp_drop("anomaly_suspected");
                         metrics.record_anomaly_drop();
                         metrics.record_drop("anomaly_suspected");
+                        continue;
+                    }
+
+                    if mmr_detector
+                        .check_smurf_with_payload(inbound.client_addr.ip(), payload, now)
+                        .is_some()
+                    {
+                        metrics.record_udp_drop("mmr_smurf_suspected");
+                        metrics.record_drop("mmr_smurf_suspected");
                         continue;
                     }
 

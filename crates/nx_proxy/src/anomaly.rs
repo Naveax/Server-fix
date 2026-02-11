@@ -30,6 +30,9 @@ struct RuntimeConfig {
     min_packets_per_window: u32,
     idle_timeout: Duration,
     max_tracked_ips: usize,
+    client_sync_check: bool,
+    client_sync_threshold_ms: f32,
+    client_sync_weight: f32,
     model: AnomalyModel,
     #[cfg(all(feature = "torch_anomaly", not(debug_assertions)))]
     torch_model_path: Option<String>,
@@ -47,6 +50,9 @@ impl RuntimeConfig {
             min_packets_per_window: anomaly.min_packets_per_window.max(1),
             idle_timeout: Duration::from_secs(anomaly.idle_timeout_secs.max(1)),
             max_tracked_ips: anomaly.max_tracked_ips.max(1),
+            client_sync_check: anomaly.client_sync_check,
+            client_sync_threshold_ms: anomaly.client_sync_threshold_ms.max(1.0),
+            client_sync_weight: anomaly.client_sync_weight.clamp(0.0, 1.0),
             model: anomaly.model,
             #[cfg(all(feature = "torch_anomaly", not(debug_assertions)))]
             torch_model_path: anomaly.torch_model_path.clone(),
@@ -62,6 +68,7 @@ struct PeerState {
     ema_pps: f64,
     ema_bps: f64,
     last_window_pps: f64,
+    sync_drift_ema_ms: f64,
     sequence_history: VecDeque<[f32; 3]>,
     last_seen: Instant,
 }
@@ -75,12 +82,19 @@ impl PeerState {
             ema_pps: 0.0,
             ema_bps: 0.0,
             last_window_pps: 0.0,
+            sync_drift_ema_ms: 0.0,
             sequence_history: VecDeque::with_capacity(TORCH_SEQUENCE_LEN),
             last_seen: now,
         }
     }
 
-    fn observe(&mut self, packet_len: usize, now: Instant, cfg: &RuntimeConfig) {
+    fn observe(
+        &mut self,
+        packet_len: usize,
+        sync_drift_ms: Option<f32>,
+        now: Instant,
+        cfg: &RuntimeConfig,
+    ) {
         let elapsed = now.saturating_duration_since(self.window_started);
         if elapsed >= cfg.window {
             let secs = elapsed.as_secs_f64().max(MIN_ELAPSED_SECS);
@@ -119,6 +133,14 @@ impl PeerState {
 
         self.packet_count = self.packet_count.saturating_add(1);
         self.byte_count = self.byte_count.saturating_add(packet_len);
+        if let Some(sync_drift_ms) = sync_drift_ms {
+            let abs_drift = sync_drift_ms.abs() as f64;
+            self.sync_drift_ema_ms = if self.sync_drift_ema_ms <= f64::EPSILON {
+                abs_drift
+            } else {
+                (cfg.ema_alpha * abs_drift) + ((1.0 - cfg.ema_alpha) * self.sync_drift_ema_ms)
+            };
+        }
         self.last_seen = now;
     }
 
@@ -175,6 +197,13 @@ impl PeerState {
             sequence.drain(0..(sequence.len() - TORCH_SEQUENCE_LEN));
         }
         sequence
+    }
+
+    fn sync_ratio(&self, cfg: &RuntimeConfig) -> f32 {
+        if !cfg.client_sync_check {
+            return 0.0;
+        }
+        (self.sync_drift_ema_ms as f32 / cfg.client_sync_threshold_ms).clamp(0.0, 8.0)
     }
 }
 
@@ -291,7 +320,16 @@ impl AnomalyDetector {
         packet_len: usize,
         now: Instant,
     ) -> Option<f32> {
-        self.should_drop_at(source_ip, packet_len, now)
+        self.should_drop_with_payload_at(source_ip, packet_len, None, now)
+    }
+
+    pub fn check_anomaly_with_payload(
+        &mut self,
+        source_ip: IpAddr,
+        payload: &[u8],
+        now: Instant,
+    ) -> Option<f32> {
+        self.should_drop_with_payload_at(source_ip, payload.len(), Some(payload), now)
     }
 
     pub fn check_anomaly_score(
@@ -300,7 +338,16 @@ impl AnomalyDetector {
         packet_len: usize,
         now: Instant,
     ) -> Option<f32> {
-        self.score_at(source_ip, packet_len, now)
+        self.score_with_payload_at(source_ip, packet_len, None, now)
+    }
+
+    pub fn check_anomaly_score_with_payload(
+        &mut self,
+        source_ip: IpAddr,
+        payload: &[u8],
+        now: Instant,
+    ) -> Option<f32> {
+        self.score_with_payload_at(source_ip, payload.len(), Some(payload), now)
     }
 
     pub(crate) fn should_drop_at(
@@ -309,7 +356,17 @@ impl AnomalyDetector {
         packet_len: usize,
         now: Instant,
     ) -> Option<f32> {
-        let score = self.score_at(source_ip, packet_len, now)?;
+        self.should_drop_with_payload_at(source_ip, packet_len, None, now)
+    }
+
+    fn should_drop_with_payload_at(
+        &mut self,
+        source_ip: IpAddr,
+        packet_len: usize,
+        payload: Option<&[u8]>,
+        now: Instant,
+    ) -> Option<f32> {
+        let score = self.score_with_payload_at(source_ip, packet_len, payload, now)?;
         if score >= self.cfg.threshold {
             Some(score)
         } else {
@@ -317,34 +374,50 @@ impl AnomalyDetector {
         }
     }
 
-    fn score_at(&mut self, source_ip: IpAddr, packet_len: usize, now: Instant) -> Option<f32> {
+    fn score_with_payload_at(
+        &mut self,
+        source_ip: IpAddr,
+        packet_len: usize,
+        payload: Option<&[u8]>,
+        now: Instant,
+    ) -> Option<f32> {
         if !self.cfg.enabled {
             return None;
         }
 
-        let (features, sequence, warmed_up) = {
+        let sync_drift = payload.and_then(parse_sync_drift_ms);
+
+        let (features, sequence, sync_ratio, warmed_up) = {
             let peer = self.peers.get_or_insert(source_ip, now);
-            peer.observe(packet_len, now, &self.cfg);
+            peer.observe(packet_len, sync_drift, now, &self.cfg);
             let warmed_up =
                 peer.packet_count >= self.cfg.min_packets_per_window || peer.ema_pps > f64::EPSILON;
             let features = peer.heuristic_features(now, &self.cfg);
             let sequence = peer.sequence_window(now);
-            (features, sequence, warmed_up)
+            let sync_ratio = peer.sync_ratio(&self.cfg);
+            (features, sequence, sync_ratio, warmed_up)
         };
         if !warmed_up {
             return None;
         }
 
-        Some(self.score_features(features, &sequence))
+        Some(self.score_features(features, sync_ratio, &sequence))
     }
 
-    fn score_features(&self, features: [f32; 3], sequence: &[[f32; 3]]) -> f32 {
-        match self.cfg.model {
+    fn score_features(&self, features: [f32; 3], sync_ratio: f32, sequence: &[[f32; 3]]) -> f32 {
+        let base = match self.cfg.model {
             AnomalyModel::Heuristic => heuristic_score(features),
             AnomalyModel::Torch => self
                 .torch_score(sequence)
                 .unwrap_or_else(|| heuristic_score(features)),
+        };
+
+        if !self.cfg.client_sync_check {
+            return base;
         }
+
+        let sync_score = logistic_score((sync_ratio - 1.0) * 2.2);
+        ((1.0 - self.cfg.client_sync_weight) * base) + (self.cfg.client_sync_weight * sync_score)
     }
 
     #[cfg(all(feature = "torch_anomaly", not(debug_assertions)))]
@@ -373,7 +446,7 @@ impl AnomalyDetector {
 
 fn heuristic_score(features: [f32; 3]) -> f32 {
     let z = (1.8 * features[0]) + (1.1 * features[1]) + (0.9 * features[2]) - 3.1;
-    1.0 / (1.0 + (-z).exp())
+    logistic_score(z)
 }
 
 #[cfg(all(feature = "torch_anomaly", not(debug_assertions)))]
@@ -476,9 +549,28 @@ fn normalize_sequence_step(step: [f32; 3]) -> [f32; 3] {
     ]
 }
 
-#[cfg(all(feature = "torch_anomaly", not(debug_assertions)))]
 fn logistic_score(v: f32) -> f32 {
     1.0 / (1.0 + (-v).exp())
+}
+
+fn parse_sync_drift_ms(payload: &[u8]) -> Option<f32> {
+    let marker = b"SYNC:";
+    let start = payload
+        .windows(marker.len())
+        .position(|window| window == marker)?;
+    let value_start = start + marker.len();
+    let tail = &payload[value_start..];
+    let value_end = tail
+        .iter()
+        .position(|byte| !matches!(byte, b'0'..=b'9' | b'.' | b'+' | b'-'))
+        .unwrap_or(tail.len());
+    if value_end == 0 {
+        return None;
+    }
+    std::str::from_utf8(&tail[..value_end])
+        .ok()?
+        .parse::<f32>()
+        .ok()
 }
 
 #[cfg(test)]
@@ -553,6 +645,40 @@ mod tests {
             }
         }
         assert!(dropped, "spike traffic should be flagged");
+    }
+
+    #[test]
+    fn client_sync_drift_raises_score() {
+        let anomaly = AnomalySection {
+            enabled: true,
+            ddos_limit: 10_000.0,
+            anomaly_threshold: 0.7,
+            min_packets_per_window: 3,
+            window_millis: 100,
+            client_sync_check: true,
+            client_sync_threshold_ms: 40.0,
+            client_sync_weight: 0.8,
+            ..AnomalySection::default()
+        };
+        let mut detector = AnomalyDetector::new(&anomaly, &rate_limit_fixture());
+        let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 42));
+        let base = Instant::now();
+
+        let _ = detector.check_anomaly_with_payload(ip, b"SYNC:10|DATA", base);
+        let _ = detector.check_anomaly_with_payload(
+            ip,
+            b"SYNC:20|DATA",
+            base + Duration::from_millis(50),
+        );
+        let flagged = detector.check_anomaly_with_payload(
+            ip,
+            b"SYNC:300|DATA",
+            base + Duration::from_millis(150),
+        );
+        assert!(
+            flagged.is_some(),
+            "high sync drift should raise anomaly score"
+        );
     }
 
     #[test]

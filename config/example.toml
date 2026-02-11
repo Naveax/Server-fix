@@ -47,6 +47,23 @@ ema_alpha = 0.35
 min_packets_per_window = 12
 max_tracked_ips = 65536
 idle_timeout_secs = 120
+client_sync_check = true
+client_sync_threshold_ms = 120.0
+client_sync_weight = 0.35
+
+[packet_validation]
+enabled = false
+strict_mode = true
+require_checksum = false
+strip_checksum_header = true
+
+[mmr]
+enabled = false
+model = "heuristic"
+mmr_threshold = 0.8
+window_secs = 30
+idle_timeout_secs = 600
+max_tracked_ips = 65536
 
 [flood_sim]
 allow_non_local = false

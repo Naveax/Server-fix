@@ -9,12 +9,18 @@ use std::time::{Duration, Instant};
 #[cfg(target_os = "linux")]
 use nx_netio::{MsgBuf, RecvBatchState};
 use nx_proxy::anomaly::AnomalyDetector;
-use nx_proxy::config::{AnomalyModel, AnomalySection, RateLimitSection};
+use nx_proxy::config::{AnomalyModel, AnomalySection, MmrSection, RateLimitSection};
+use nx_proxy::mmr::MmrDetector;
+use nx_proxy::packet::{
+    build_checksum_packet, validate_packet, PacketLimits, PacketValidationPolicy,
+};
 
 const PACKETS: usize = 20_000;
 #[cfg(target_os = "linux")]
 const BATCH: usize = 32;
 const ANOMALY_SAMPLES: usize = 20_000;
+const PACKET_VALIDATION_SAMPLES: usize = 10_000;
+const MMR_SAMPLES: usize = 10_000;
 const ANOMALY_THRESHOLDS: [f32; 3] = [0.5, 0.7, 0.9];
 const AUC_SWEEP_THRESHOLDS: [f64; 11] = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0];
 
@@ -86,6 +92,16 @@ fn main() {
         }
         print_threshold_deltas("anomaly_cuda", &cuda_threshold_metrics);
     }
+
+    let (packet_p50, packet_p99, packet_drop_ratio) = bench_packet_integrity_validation();
+    println!("packet_validation_latency_p50_us={packet_p50:.2}");
+    println!("packet_validation_latency_p99_us={packet_p99:.2}");
+    println!("packet_validation_drop_ratio={packet_drop_ratio:.4}");
+
+    let (mmr_p50, mmr_p99, mmr_drop_ratio) = bench_mmr_detector();
+    println!("mmr_detection_latency_p50_us={mmr_p50:.2}");
+    println!("mmr_detection_latency_p99_us={mmr_p99:.2}");
+    println!("mmr_detection_drop_ratio={mmr_drop_ratio:.4}");
 }
 
 fn threshold_label(threshold: f32) -> String {
@@ -295,6 +311,9 @@ fn anomaly_cfg_with_threshold(anomaly_threshold: f32) -> AnomalySection {
         min_packets_per_window: 8,
         max_tracked_ips: 1024,
         idle_timeout_secs: 60,
+        client_sync_check: true,
+        client_sync_threshold_ms: 120.0,
+        client_sync_weight: 0.35,
         torch_model_path: None,
     }
 }
@@ -474,6 +493,75 @@ fn auc_from_scored_samples(samples: &[(f64, bool)]) -> f64 {
         auc += width * (y0 + y1) * 0.5;
     }
     auc.clamp(0.0, 1.0)
+}
+
+fn bench_packet_integrity_validation() -> (f64, f64, f64) {
+    let limits = PacketLimits {
+        min_packet_size: 1,
+        max_packet_size: 1400,
+    };
+    let policy = PacketValidationPolicy {
+        enabled: true,
+        strict_mode: true,
+        require_checksum: true,
+        strip_checksum_header: true,
+    };
+
+    let mut latencies_us = Vec::with_capacity(PACKET_VALIDATION_SAMPLES);
+    let mut drops = 0usize;
+    for i in 0..PACKET_VALIDATION_SAMPLES {
+        let mut packet = build_checksum_packet(b"SYNC:8|MMR:1210|DATA");
+        if i % 5 == 0 {
+            packet[6] ^= 0x7A;
+        }
+        let start = Instant::now();
+        if validate_packet(&packet, limits, policy).is_err() {
+            drops = drops.saturating_add(1);
+        }
+        latencies_us.push(start.elapsed().as_secs_f64() * 1_000_000.0);
+    }
+
+    latencies_us.sort_by(|a, b| a.partial_cmp(b).expect("valid float compare"));
+    let p50 = percentile(&latencies_us, 0.50);
+    let p99 = percentile(&latencies_us, 0.99);
+    let drop_ratio = drops as f64 / PACKET_VALIDATION_SAMPLES as f64;
+    (p50, p99, drop_ratio)
+}
+
+fn bench_mmr_detector() -> (f64, f64, f64) {
+    let mut detector = MmrDetector::new(&MmrSection {
+        enabled: true,
+        mmr_threshold: 0.8,
+        ..MmrSection::default()
+    });
+    let src = IpAddr::V4(Ipv4Addr::new(10, 77, 2, 1));
+    let base = Instant::now();
+    let mut latencies_us = Vec::with_capacity(MMR_SAMPLES);
+    let mut drops = 0usize;
+
+    for i in 0..MMR_SAMPLES {
+        let mmr = if i % 97 == 0 {
+            2100
+        } else {
+            1200 + (i % 8) as i32
+        };
+        let payload = format!("MMR:{mmr}|SYNC:12");
+        let now = base + Duration::from_millis(i as u64);
+        let start = Instant::now();
+        if detector
+            .check_smurf_with_payload(src, payload.as_bytes(), now)
+            .is_some()
+        {
+            drops = drops.saturating_add(1);
+        }
+        latencies_us.push(start.elapsed().as_secs_f64() * 1_000_000.0);
+    }
+
+    latencies_us.sort_by(|a, b| a.partial_cmp(b).expect("valid float compare"));
+    let p50 = percentile(&latencies_us, 0.50);
+    let p99 = percentile(&latencies_us, 0.99);
+    let drop_ratio = drops as f64 / MMR_SAMPLES as f64;
+    (p50, p99, drop_ratio)
 }
 
 fn rate_cfg() -> RateLimitSection {

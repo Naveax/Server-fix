@@ -10,7 +10,11 @@ pub struct ProxyConfig {
     pub proxy: ProxySection,
     pub rate_limit: RateLimitSection,
     #[serde(default)]
+    pub packet_validation: PacketValidationSection,
+    #[serde(default)]
     pub anomaly: AnomalySection,
+    #[serde(default)]
+    pub mmr: MmrSection,
     #[serde(default)]
     pub flood_sim: FloodSimSection,
     #[serde(default, alias = "challenge")]
@@ -142,6 +146,12 @@ pub struct AnomalySection {
     #[serde(default = "default_anomaly_idle_timeout_secs")]
     pub idle_timeout_secs: u64,
     #[serde(default)]
+    pub client_sync_check: bool,
+    #[serde(default = "default_client_sync_threshold_ms")]
+    pub client_sync_threshold_ms: f32,
+    #[serde(default = "default_client_sync_weight")]
+    pub client_sync_weight: f32,
+    #[serde(default)]
     pub torch_model_path: Option<String>,
 }
 
@@ -157,6 +167,64 @@ impl Default for AnomalySection {
             min_packets_per_window: default_anomaly_min_packets(),
             max_tracked_ips: default_anomaly_max_tracked_ips(),
             idle_timeout_secs: default_anomaly_idle_timeout_secs(),
+            client_sync_check: false,
+            client_sync_threshold_ms: default_client_sync_threshold_ms(),
+            client_sync_weight: default_client_sync_weight(),
+            torch_model_path: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PacketValidationSection {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_true")]
+    pub strict_mode: bool,
+    #[serde(default)]
+    pub require_checksum: bool,
+    #[serde(default)]
+    pub strip_checksum_header: bool,
+}
+
+impl Default for PacketValidationSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            strict_mode: true,
+            require_checksum: false,
+            strip_checksum_header: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MmrSection {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub model: MmrModel,
+    #[serde(default = "default_mmr_threshold")]
+    pub mmr_threshold: f32,
+    #[serde(default = "default_mmr_window_secs")]
+    pub window_secs: u64,
+    #[serde(default = "default_mmr_idle_timeout_secs")]
+    pub idle_timeout_secs: u64,
+    #[serde(default = "default_mmr_max_tracked_ips")]
+    pub max_tracked_ips: usize,
+    #[serde(default)]
+    pub torch_model_path: Option<String>,
+}
+
+impl Default for MmrSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            model: MmrModel::default(),
+            mmr_threshold: default_mmr_threshold(),
+            window_secs: default_mmr_window_secs(),
+            idle_timeout_secs: default_mmr_idle_timeout_secs(),
+            max_tracked_ips: default_mmr_max_tracked_ips(),
             torch_model_path: None,
         }
     }
@@ -229,6 +297,14 @@ pub enum CookieMode {
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum AnomalyModel {
+    #[default]
+    Heuristic,
+    Torch,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MmrModel {
     #[default]
     Heuristic,
     Torch,
@@ -358,6 +434,30 @@ fn default_anomaly_idle_timeout_secs() -> u64 {
     120
 }
 
+fn default_client_sync_threshold_ms() -> f32 {
+    120.0
+}
+
+fn default_client_sync_weight() -> f32 {
+    0.35
+}
+
+fn default_mmr_threshold() -> f32 {
+    0.80
+}
+
+fn default_mmr_window_secs() -> u64 {
+    30
+}
+
+fn default_mmr_idle_timeout_secs() -> u64 {
+    600
+}
+
+fn default_mmr_max_tracked_ips() -> usize {
+    65_536
+}
+
 fn default_cookie_secret() -> String {
     "replace-me".to_string()
 }
@@ -474,6 +574,12 @@ impl ProxyConfig {
         if self.anomaly.idle_timeout_secs == 0 {
             bail!("anomaly.idle_timeout_secs must be > 0");
         }
+        if self.anomaly.client_sync_threshold_ms <= 0.0 {
+            bail!("anomaly.client_sync_threshold_ms must be > 0");
+        }
+        if !(0.0..=1.0).contains(&self.anomaly.client_sync_weight) {
+            bail!("anomaly.client_sync_weight must be in range [0, 1]");
+        }
 
         #[cfg(not(feature = "torch_anomaly"))]
         if self.anomaly.enabled && self.anomaly.model == AnomalyModel::Torch {
@@ -486,6 +592,33 @@ impl ProxyConfig {
             };
             if path.trim().is_empty() {
                 bail!("anomaly.torch_model_path must be non-empty when anomaly.model=torch");
+            }
+        }
+
+        if !(0.0..=1.0).contains(&self.mmr.mmr_threshold) || self.mmr.mmr_threshold <= 0.0 {
+            bail!("mmr.mmr_threshold must be in range (0, 1]");
+        }
+        if self.mmr.window_secs == 0 {
+            bail!("mmr.window_secs must be > 0");
+        }
+        if self.mmr.idle_timeout_secs == 0 {
+            bail!("mmr.idle_timeout_secs must be > 0");
+        }
+        if self.mmr.max_tracked_ips == 0 {
+            bail!("mmr.max_tracked_ips must be > 0");
+        }
+
+        #[cfg(not(feature = "torch_anomaly"))]
+        if self.mmr.enabled && self.mmr.model == MmrModel::Torch {
+            bail!("mmr.model=torch requires feature torch_anomaly");
+        }
+        #[cfg(feature = "torch_anomaly")]
+        if self.mmr.enabled && self.mmr.model == MmrModel::Torch {
+            let Some(path) = &self.mmr.torch_model_path else {
+                bail!("mmr.torch_model_path must be set when mmr.model=torch");
+            };
+            if path.trim().is_empty() {
+                bail!("mmr.torch_model_path must be non-empty when mmr.model=torch");
             }
         }
 
@@ -564,6 +697,23 @@ ema_alpha = 0.35
 min_packets_per_window = 8
 max_tracked_ips = 4096
 idle_timeout_secs = 120
+client_sync_check = true
+client_sync_threshold_ms = 150.0
+client_sync_weight = 0.4
+
+[packet_validation]
+enabled = true
+strict_mode = true
+require_checksum = true
+strip_checksum_header = true
+
+[mmr]
+enabled = true
+model = "heuristic"
+mmr_threshold = 0.8
+window_secs = 60
+idle_timeout_secs = 1200
+max_tracked_ips = 4096
 
 [flood_sim]
 allow_non_local = false
@@ -598,6 +748,13 @@ listen_addr = "127.0.0.1:9200"
         assert!(parsed.anomaly.enabled);
         assert_eq!(parsed.anomaly.anomaly_threshold, 0.8);
         assert_eq!(parsed.anomaly.ddos_limit, 500.0);
+        assert!(parsed.anomaly.client_sync_check);
+        assert_eq!(parsed.anomaly.client_sync_threshold_ms, 150.0);
+        assert_eq!(parsed.anomaly.client_sync_weight, 0.4);
+        assert!(parsed.packet_validation.enabled);
+        assert!(parsed.packet_validation.require_checksum);
+        assert_eq!(parsed.mmr.mmr_threshold, 0.8);
+        assert!(parsed.mmr.enabled);
         assert!(!parsed.flood_sim.allow_non_local);
     }
 
@@ -707,6 +864,16 @@ listen_addr = "127.0.0.1:9200"
         let cfg = good_config().replace("model = \"heuristic\"\n", "");
         let parsed = ProxyConfig::from_toml(&cfg).expect("config should parse");
         assert_eq!(parsed.anomaly.model, AnomalyModel::Heuristic);
+    }
+
+    #[test]
+    fn reject_invalid_mmr_threshold() {
+        let cfg = good_config().replace("mmr_threshold = 0.8", "mmr_threshold = 1.5");
+        let err = ProxyConfig::from_toml(&cfg).expect_err("should fail validation");
+        assert!(
+            err.to_string().contains("mmr.mmr_threshold"),
+            "unexpected error: {err}"
+        );
     }
 
     #[cfg(not(feature = "torch_anomaly"))]
