@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdint>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -13,7 +14,7 @@ struct MetricLabel {
 class IMetricSink {
  public:
   virtual ~IMetricSink() = default;
-  virtual void inc_counter(std::string_view name, uint64_t value = 1,
+  virtual void inc_counter(std::string_view name, std::uint64_t value = 1,
                            const std::vector<MetricLabel>& labels = {}) = 0;
   virtual void set_gauge(std::string_view name, double value,
                          const std::vector<MetricLabel>& labels = {}) = 0;
@@ -23,7 +24,7 @@ class IMetricSink {
 
 class NoopMetricSink final : public IMetricSink {
  public:
-  void inc_counter(std::string_view, uint64_t, const std::vector<MetricLabel>&) override {}
+  void inc_counter(std::string_view, std::uint64_t, const std::vector<MetricLabel>&) override {}
   void set_gauge(std::string_view, double, const std::vector<MetricLabel>&) override {}
   void observe_histogram(std::string_view, double, const std::vector<MetricLabel>&) override {}
 };
