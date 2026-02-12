@@ -9,6 +9,11 @@ crates/nx_fuzz/artifacts/
 /fuzz_runs/
 /fuzz-*.log
 
+# Local simulation reports
+nx_eos_sim_*.json
+nx_eos_sim_*.csv
+nx_eos_sim_*.txt
+
 # CMake / build outputs
 /build/
 /build-*/
