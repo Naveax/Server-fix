@@ -5,6 +5,11 @@
 - Build: `cmake --build build -j`
 - Test: `ctest --test-dir build`
 
+## Windows (Visual Studio Generator)
+- Visual Studio is multi-config; pass `-C Debug` or `-C Release` to `ctest`:
+  - `ctest --test-dir build-win -C Debug --output-on-failure`
+  - `ctest --test-dir build-win -C Release --output-on-failure`
+
 ## Fuzz Build (libFuzzer)
 - Requires Clang/LLVM. GCC does not support `-fsanitize=fuzzer`.
 - Configure: `cmake --preset fuzz` (or set `CC=clang CXX=clang++`).
