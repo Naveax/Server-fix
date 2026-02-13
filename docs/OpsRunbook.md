@@ -13,7 +13,7 @@
 
 ## Queue Limit Semantics
 - `telemetry` lane: drop-oldest under pressure.
-- `critical` lane: drop-newest or bounded block-with-timeout.
+- `critical` lane: prefer drop-oldest for real-time freshness; drop-newest and bounded block-with-timeout are available but can increase tail latency under overload.
 - Ingress hot path must remain non-blocking: never allow per-session backpressure to stall the worker (cross-session HOL blocking).
 - In worker-sharded deployments, queue and session limits are enforced per worker unless explicitly normalized.
 

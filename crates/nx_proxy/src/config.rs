@@ -283,6 +283,7 @@ pub struct MetricsSection {
 pub enum CriticalOverflowPolicy {
     #[default]
     DropNewest,
+    DropOldest,
     BlockWithTimeout,
 }
 

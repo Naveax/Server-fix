@@ -16,3 +16,10 @@
 
 ## WSL Notes
 - For best performance and correct timestamps, build within the WSL Linux filesystem (e.g. `~/project`) instead of `/mnt/c` or `/mnt/d`.
+
+## Windows + WSL Build Directories
+- Do not reuse the same CMake build directory between WSL and Windows. CMake caches absolute paths and will error if the source/build paths change (e.g. `/mnt/d/...` vs `D:\\...`).
+- Use separate build dirs:
+  - WSL: `cmake -S . -B build-wsl && cmake --build build-wsl -j && ctest --test-dir build-wsl --output-on-failure`
+  - PowerShell: `cmake -S . -B build-win; cmake --build build-win --parallel; ctest --test-dir build-win --output-on-failure`
+- If you already have a mismatched cache, delete the build dir and re-configure in the same environment.

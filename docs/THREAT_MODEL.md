@@ -30,7 +30,7 @@
    - bounded cookie peer tracking
 6. Queue hardening:
    - telemetry lane `drop_oldest`
-   - critical lane `drop_newest` or `block_with_timeout`
+   - critical lane `drop_oldest` (preferred), `drop_newest`, or `block_with_timeout`
    - queue depth visibility in metrics
 7. Fast fail behavior:
    - parse/validation failures are dropped immediately

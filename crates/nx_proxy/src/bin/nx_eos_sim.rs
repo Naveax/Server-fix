@@ -1052,6 +1052,9 @@ fn spawn_server(
 
                         if payload.starts_with("CRIT ") {
                             stats.packets_critical = stats.packets_critical.saturating_add(1);
+                            // Treat any valid control-path traffic as an implicit join to reduce
+                            // handshake loss sensitivity under overload (keeps comparisons stable).
+                            matchmaker.on_join(peer);
                             let mut parts = payload.split_whitespace();
                             let _ = parts.next();
                             let _cid = parts.next();
@@ -1783,6 +1786,7 @@ fn parse_usize_csv(value: &str) -> Result<Vec<usize>, String> {
 fn parse_critical_overflow_policy(value: &str) -> Option<CriticalOverflowPolicy> {
     match value {
         "drop-newest" => Some(CriticalOverflowPolicy::DropNewest),
+        "drop-oldest" => Some(CriticalOverflowPolicy::DropOldest),
         "block" | "block-with-timeout" => Some(CriticalOverflowPolicy::BlockWithTimeout),
         _ => None,
     }
@@ -1956,7 +1960,7 @@ fn parse_args() -> Result<SimArgs, String> {
                 proxy_critical_overflow_policy =
                     parse_critical_overflow_policy(v).ok_or_else(|| {
                         format!(
-                            "invalid --proxy-critical-overflow '{v}', use drop-newest|block-with-timeout"
+                            "invalid --proxy-critical-overflow '{v}', use drop-newest|drop-oldest|block-with-timeout"
                         )
                     })?;
             }
@@ -2066,7 +2070,7 @@ fn print_help() {
          \t--proxy-queue-capacity=96\n\
          \t--proxy-telemetry-queue-capacity=48\n\
          \t--proxy-critical-queue-capacity=64\n\
-         \t--proxy-critical-overflow=drop-newest|block-with-timeout\n\
+         \t--proxy-critical-overflow=drop-newest|drop-oldest|block-with-timeout\n\
          \t--proxy-critical-block-timeout-ms=5\n"
     );
 }

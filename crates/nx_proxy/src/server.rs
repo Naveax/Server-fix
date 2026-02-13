@@ -597,10 +597,18 @@ async fn run_session_worker(
 
     loop {
         tokio::select! {
+            biased;
+
             _ = shutdown.cancelled() => break,
-            outbound = recv_prioritized(&critical_rx, &telemetry_rx, &shutdown) => {
-                let Some(payload) = outbound else {
-                    break;
+            outbound = critical_rx.recv_async() => {
+                let payload = match outbound {
+                    Ok(payload) => payload,
+                    Err(_) => {
+                        if telemetry_rx.is_disconnected() {
+                            break;
+                        }
+                        continue;
+                    }
                 };
 
                 metrics.set_udp_queue_depth("client_to_upstream", "critical", critical_rx.len() as i64);
@@ -655,6 +663,32 @@ async fn run_session_worker(
                 handle_queue_outcome(&metrics, queue_result, "upstream_to_client");
                 if matches!(queue_result, QueueOutcome::Disconnected) {
                     break;
+                }
+            }
+            outbound = telemetry_rx.recv_async() => {
+                let payload = match outbound {
+                    Ok(payload) => payload,
+                    Err(_) => {
+                        if critical_rx.is_disconnected() {
+                            break;
+                        }
+                        continue;
+                    }
+                };
+
+                metrics.set_udp_queue_depth("client_to_upstream", "critical", critical_rx.len() as i64);
+                metrics.set_udp_queue_depth("client_to_upstream", "telemetry", telemetry_rx.len() as i64);
+
+                match upstream_socket.send(&payload).await {
+                    Ok(_) => {
+                        metrics.record_udp_packet_forwarded();
+                        metrics.record_forwarded("client_to_upstream");
+                    }
+                    Err(_) => {
+                        metrics.record_udp_drop("upstream_send_error");
+                        metrics.record_drop("upstream_send_error");
+                        break;
+                    }
                 }
             }
         }
@@ -746,6 +780,22 @@ async fn enqueue_laned<T>(
                 Err(TrySendError::Full(_)) => QueueOutcome::Dropped {
                     reason: "queue_full_critical",
                 },
+            },
+            CriticalOverflowPolicy::DropOldest => match critical_tx.try_send(item) {
+                Ok(_) => QueueOutcome::Enqueued,
+                Err(TrySendError::Disconnected(_)) => QueueOutcome::Disconnected,
+                Err(TrySendError::Full(item)) => {
+                    let _ = critical_tap_rx.try_recv();
+                    match critical_tx.try_send(item) {
+                        Ok(_) => QueueOutcome::DroppedOldestEnqueued {
+                            reason: "queue_full_critical",
+                        },
+                        Err(TrySendError::Full(_)) => QueueOutcome::Dropped {
+                            reason: "queue_full_critical",
+                        },
+                        Err(TrySendError::Disconnected(_)) => QueueOutcome::Disconnected,
+                    }
+                }
             },
             CriticalOverflowPolicy::BlockWithTimeout => {
                 // Never block the hot ingress path (worker thread) on per-session backpressure.
