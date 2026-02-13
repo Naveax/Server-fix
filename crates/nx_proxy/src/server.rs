@@ -471,6 +471,7 @@ async fn run_worker(
                         &session.telemetry_tap_rx,
                         config.proxy.critical_overflow_policy,
                         critical_timeout,
+                        false,
                         &metrics,
                         "client_to_upstream",
                     )
@@ -646,6 +647,7 @@ async fn run_session_worker(
                     &downstream_telemetry_tap,
                     critical_policy,
                     critical_timeout,
+                    true,
                     &metrics,
                     "upstream_to_client",
                 ).await;
@@ -716,6 +718,7 @@ async fn enqueue_laned<T>(
     telemetry_tap_rx: &Receiver<T>,
     critical_policy: CriticalOverflowPolicy,
     critical_timeout: Duration,
+    allow_blocking: bool,
     metrics: &ProxyMetrics,
     direction: &'static str,
 ) -> QueueOutcome {
@@ -745,12 +748,25 @@ async fn enqueue_laned<T>(
                 },
             },
             CriticalOverflowPolicy::BlockWithTimeout => {
-                match tokio::time::timeout(critical_timeout, critical_tx.send_async(item)).await {
-                    Ok(Ok(_)) => QueueOutcome::Enqueued,
-                    Ok(Err(_)) => QueueOutcome::Disconnected,
-                    Err(_) => QueueOutcome::Dropped {
-                        reason: "queue_full_critical_timeout",
-                    },
+                // Never block the hot ingress path (worker thread) on per-session backpressure.
+                // Blocking here causes cross-session head-of-line blocking and tail-latency spikes.
+                if !allow_blocking {
+                    match critical_tx.try_send(item) {
+                        Ok(_) => QueueOutcome::Enqueued,
+                        Err(TrySendError::Disconnected(_)) => QueueOutcome::Disconnected,
+                        Err(TrySendError::Full(_)) => QueueOutcome::Dropped {
+                            reason: "queue_full_critical",
+                        },
+                    }
+                } else {
+                    match tokio::time::timeout(critical_timeout, critical_tx.send_async(item)).await
+                    {
+                        Ok(Ok(_)) => QueueOutcome::Enqueued,
+                        Ok(Err(_)) => QueueOutcome::Disconnected,
+                        Err(_) => QueueOutcome::Dropped {
+                            reason: "queue_full_critical_timeout",
+                        },
+                    }
                 }
             }
         },
