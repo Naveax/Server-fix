@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
@@ -34,6 +34,7 @@ struct SessionHandle {
     critical_tap_rx: Receiver<Vec<u8>>,
     telemetry_tap_rx: Receiver<Vec<u8>>,
     last_seen: Instant,
+    session_shutdown: CancellationToken,
 }
 
 #[derive(Debug)]
@@ -310,7 +311,11 @@ async fn run_worker(
                 let now = Instant::now();
                 sessions.retain(|_, session| {
                     let active = !session.critical_tx.is_disconnected() || !session.telemetry_tx.is_disconnected();
-                    active && now.saturating_duration_since(session.last_seen) <= idle_timeout
+                    let keep = active && now.saturating_duration_since(session.last_seen) <= idle_timeout;
+                    if !keep {
+                        session.session_shutdown.cancel();
+                    }
+                    keep
                 });
             }
             recv = ingress_io.recv(&client_socket, &metrics) => {
@@ -454,22 +459,30 @@ async fn run_worker(
                     session.last_seen = Instant::now();
 
                     let lane = classify_lane(payload, &telemetry_prefixes);
-                    let queue_result = enqueue_laned(
-                        payload.to_vec(),
-                        lane,
-                        &session.critical_tx,
-                        &session.critical_tap_rx,
-                        &session.telemetry_tx,
-                        &session.telemetry_tap_rx,
-                        config.proxy.critical_overflow_policy,
-                        critical_timeout,
-                        false,
-                        &metrics,
-                        "client_to_upstream",
-                    )
-                    .await;
+                    let queue_result = {
+                        let payload = payload.to_vec();
+                        enqueue_laned(
+                            payload,
+                            lane,
+                            &session.critical_tx,
+                            &session.critical_tap_rx,
+                            &session.telemetry_tx,
+                            &session.telemetry_tap_rx,
+                            config.proxy.critical_overflow_policy,
+                            critical_timeout,
+                            false,
+                            &metrics,
+                            "client_to_upstream",
+                        )
+                        .await
+                    };
 
                     handle_queue_outcome(&metrics, queue_result, "client_to_upstream");
+                    if matches!(queue_result, QueueOutcome::Disconnected) {
+                        if let Some(session) = sessions.remove(&client_addr) {
+                            session.session_shutdown.cancel();
+                        }
+                    }
                 }
             }
         }
@@ -536,17 +549,26 @@ async fn spawn_session(
         .connect(upstream_addr)
         .await
         .context("failed to connect upstream session socket")?;
+    let upstream_socket = Arc::new(upstream_socket);
 
     let (critical_tx, critical_rx) = flume::bounded(critical_queue_capacity);
     let critical_tap_rx = critical_rx.clone();
     let (telemetry_tx, telemetry_rx) = flume::bounded(telemetry_queue_capacity);
     let telemetry_tap_rx = telemetry_rx.clone();
 
-    tokio::spawn(run_session_worker(
-        client_addr,
-        upstream_socket,
+    let session_shutdown = shutdown.child_token();
+
+    tokio::spawn(run_session_upstream_send_worker(
+        Arc::clone(&upstream_socket),
         critical_rx,
         telemetry_rx,
+        metrics.clone(),
+        session_shutdown.clone(),
+    ));
+
+    tokio::spawn(run_session_upstream_recv_worker(
+        client_addr,
+        upstream_socket,
         downstream_critical_tx,
         downstream_critical_tap,
         downstream_telemetry_tx,
@@ -555,7 +577,7 @@ async fn spawn_session(
         critical_policy,
         critical_timeout,
         metrics,
-        shutdown,
+        session_shutdown.clone(),
         max_datagram_bytes,
     ));
 
@@ -565,28 +587,18 @@ async fn spawn_session(
         critical_tap_rx,
         telemetry_tap_rx,
         last_seen: Instant::now(),
+        session_shutdown,
     })
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn run_session_worker(
-    client_addr: SocketAddr,
-    upstream_socket: UdpSocket,
+async fn run_session_upstream_send_worker(
+    upstream_socket: Arc<UdpSocket>,
     critical_rx: Receiver<Vec<u8>>,
     telemetry_rx: Receiver<Vec<u8>>,
-    downstream_critical_tx: Sender<DownstreamPacket>,
-    downstream_critical_tap: Receiver<DownstreamPacket>,
-    downstream_telemetry_tx: Sender<DownstreamPacket>,
-    downstream_telemetry_tap: Receiver<DownstreamPacket>,
-    telemetry_prefixes: Arc<Vec<Vec<u8>>>,
-    critical_policy: CriticalOverflowPolicy,
-    critical_timeout: Duration,
     metrics: ProxyMetrics,
     shutdown: CancellationToken,
-    max_datagram_bytes: usize,
 ) {
-    let mut recv_buf = vec![0u8; max_datagram_bytes.max(1)];
-
     loop {
         tokio::select! {
             biased;
@@ -618,6 +630,56 @@ async fn run_session_worker(
                     }
                 }
             }
+            outbound = telemetry_rx.recv_async() => {
+                let payload = match outbound {
+                    Ok(payload) => payload,
+                    Err(_) => {
+                        if critical_rx.is_disconnected() {
+                            break;
+                        }
+                        continue;
+                    }
+                };
+
+                metrics.set_udp_queue_depth("client_to_upstream", "critical", critical_rx.len() as i64);
+                metrics.set_udp_queue_depth("client_to_upstream", "telemetry", telemetry_rx.len() as i64);
+
+                match upstream_socket.send(&payload).await {
+                    Ok(_) => {
+                        metrics.record_udp_packet_forwarded();
+                        metrics.record_forwarded("client_to_upstream");
+                    }
+                    Err(_) => {
+                        metrics.record_udp_drop("upstream_send_error");
+                        metrics.record_drop("upstream_send_error");
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_session_upstream_recv_worker(
+    client_addr: SocketAddr,
+    upstream_socket: Arc<UdpSocket>,
+    downstream_critical_tx: Sender<DownstreamPacket>,
+    downstream_critical_tap: Receiver<DownstreamPacket>,
+    downstream_telemetry_tx: Sender<DownstreamPacket>,
+    downstream_telemetry_tap: Receiver<DownstreamPacket>,
+    telemetry_prefixes: Arc<Vec<Vec<u8>>>,
+    critical_policy: CriticalOverflowPolicy,
+    critical_timeout: Duration,
+    metrics: ProxyMetrics,
+    shutdown: CancellationToken,
+    max_datagram_bytes: usize,
+) {
+    let mut recv_buf = vec![0u8; max_datagram_bytes.max(1)];
+
+    loop {
+        tokio::select! {
+            _ = shutdown.cancelled() => break,
             recv = upstream_socket.recv(&mut recv_buf) => {
                 let len = match recv {
                     Ok(len) => len,
@@ -662,32 +724,6 @@ async fn run_session_worker(
                     break;
                 }
             }
-            outbound = telemetry_rx.recv_async() => {
-                let payload = match outbound {
-                    Ok(payload) => payload,
-                    Err(_) => {
-                        if critical_rx.is_disconnected() {
-                            break;
-                        }
-                        continue;
-                    }
-                };
-
-                metrics.set_udp_queue_depth("client_to_upstream", "critical", critical_rx.len() as i64);
-                metrics.set_udp_queue_depth("client_to_upstream", "telemetry", telemetry_rx.len() as i64);
-
-                match upstream_socket.send(&payload).await {
-                    Ok(_) => {
-                        metrics.record_udp_packet_forwarded();
-                        metrics.record_forwarded("client_to_upstream");
-                    }
-                    Err(_) => {
-                        metrics.record_udp_drop("upstream_send_error");
-                        metrics.record_drop("upstream_send_error");
-                        break;
-                    }
-                }
-            }
         }
     }
 }
@@ -705,50 +741,147 @@ async fn run_downstream_worker(
 ) {
     let mut egress_io = EgressIo::new(batch_size.max(1));
 
-    loop {
-        let Some(first) = recv_prioritized(&critical_rx, &telemetry_rx, &shutdown).await else {
-            break;
-        };
+    #[derive(Debug, Default)]
+    struct ClientQueue {
+        critical: VecDeque<DownstreamPacket>,
+        telemetry: Option<DownstreamPacket>,
+    }
 
-        let mut batch = Vec::with_capacity(batch_size.max(1));
-        batch.push(first);
-        while batch.len() < batch.capacity() {
-            if let Ok(packet) = critical_rx.try_recv() {
-                batch.push(packet);
+    impl ClientQueue {
+        fn is_empty(&self) -> bool {
+            self.critical.is_empty() && self.telemetry.is_none()
+        }
+    }
+
+    let mut rr: VecDeque<SocketAddr> = VecDeque::new();
+    let mut per_client: HashMap<SocketAddr, ClientQueue> = HashMap::new();
+    let mut pending_critical: usize = 0;
+    let mut pending_telemetry: usize = 0;
+
+    let drain_limit = batch_size.max(1) * 4;
+
+    loop {
+        if rr.is_empty() {
+            let Some(first) = recv_prioritized(&critical_rx, &telemetry_rx, &shutdown).await else {
+                break;
+            };
+
+            let addr = first.client_addr;
+            let q = per_client.entry(addr).or_default();
+            let was_empty = q.is_empty();
+            match first.lane {
+                TrafficLane::Critical => {
+                    pending_critical = pending_critical.saturating_add(1);
+                    q.critical.push_back(first);
+                }
+                TrafficLane::Telemetry => {
+                    if q.telemetry.is_some() {
+                        pending_telemetry = pending_telemetry.saturating_sub(1);
+                        metrics.record_udp_drop("downstream_telemetry_coalesced");
+                        metrics.record_drop("downstream_telemetry_coalesced");
+                    }
+                    pending_telemetry = pending_telemetry.saturating_add(1);
+                    q.telemetry = Some(first);
+                }
+            }
+            if was_empty {
+                rr.push_back(addr);
+            }
+        }
+
+        let mut drained = 0usize;
+        while drained < drain_limit {
+            if let Ok(pkt) = critical_rx.try_recv() {
+                drained = drained.saturating_add(1);
+                let addr = pkt.client_addr;
+                let q = per_client.entry(addr).or_default();
+                let was_empty = q.is_empty();
+                pending_critical = pending_critical.saturating_add(1);
+                q.critical.push_back(pkt);
+                if was_empty {
+                    rr.push_back(addr);
+                }
                 continue;
             }
-            if let Ok(packet) = telemetry_rx.try_recv() {
-                batch.push(packet);
+            if let Ok(pkt) = telemetry_rx.try_recv() {
+                drained = drained.saturating_add(1);
+                let addr = pkt.client_addr;
+                let q = per_client.entry(addr).or_default();
+                let was_empty = q.is_empty();
+                if q.telemetry.is_some() {
+                    pending_telemetry = pending_telemetry.saturating_sub(1);
+                    metrics.record_udp_drop("downstream_telemetry_coalesced");
+                    metrics.record_drop("downstream_telemetry_coalesced");
+                }
+                pending_telemetry = pending_telemetry.saturating_add(1);
+                q.telemetry = Some(pkt);
+                if was_empty {
+                    rr.push_back(addr);
+                }
                 continue;
             }
             break;
         }
 
-        metrics.set_udp_queue_depth("upstream_to_client", "critical", critical_rx.len() as i64);
-        metrics.set_udp_queue_depth("upstream_to_client", "telemetry", telemetry_rx.len() as i64);
+        metrics.set_udp_queue_depth(
+            "upstream_to_client",
+            "critical",
+            (critical_rx.len().saturating_add(pending_critical)) as i64,
+        );
+        metrics.set_udp_queue_depth(
+            "upstream_to_client",
+            "telemetry",
+            (telemetry_rx.len().saturating_add(pending_telemetry)) as i64,
+        );
 
-        if !critical_ttl.is_zero() || !telemetry_ttl.is_zero() {
-            let now = Instant::now();
-            batch.retain(|pkt| {
-                let ttl = match pkt.lane {
-                    TrafficLane::Critical => critical_ttl,
-                    TrafficLane::Telemetry => telemetry_ttl,
-                };
-                if ttl.is_zero() {
-                    return true;
-                }
-                if now.saturating_duration_since(pkt.enqueued_at) <= ttl {
-                    return true;
+        let now = Instant::now();
+        let mut batch = Vec::with_capacity(batch_size.max(1));
+        while batch.len() < batch.capacity() && !rr.is_empty() {
+            let addr = rr.pop_front().expect("rr not empty");
+            let Some(q) = per_client.get_mut(&addr) else {
+                continue;
+            };
+
+            // Per-client fairness: at most one packet per client per scheduling step.
+            let mut picked: Option<DownstreamPacket> = None;
+            while picked.is_none() {
+                if let Some(pkt) = q.critical.pop_front() {
+                    pending_critical = pending_critical.saturating_sub(1);
+                    picked = Some(pkt);
+                } else if let Some(pkt) = q.telemetry.take() {
+                    pending_telemetry = pending_telemetry.saturating_sub(1);
+                    picked = Some(pkt);
+                } else {
+                    break;
                 }
 
-                let reason = match pkt.lane {
-                    TrafficLane::Critical => "downstream_stale_critical",
-                    TrafficLane::Telemetry => "downstream_stale_telemetry",
-                };
-                metrics.record_udp_drop(reason);
-                metrics.record_drop(reason);
-                false
-            });
+                if let Some(pkt) = picked.as_ref() {
+                    let ttl = match pkt.lane {
+                        TrafficLane::Critical => critical_ttl,
+                        TrafficLane::Telemetry => telemetry_ttl,
+                    };
+                    if !ttl.is_zero() && now.saturating_duration_since(pkt.enqueued_at) > ttl {
+                        let reason = match pkt.lane {
+                            TrafficLane::Critical => "downstream_stale_critical",
+                            TrafficLane::Telemetry => "downstream_stale_telemetry",
+                        };
+                        metrics.record_udp_drop(reason);
+                        metrics.record_drop(reason);
+                        picked = None;
+                        continue;
+                    }
+                }
+            }
+
+            if q.is_empty() {
+                per_client.remove(&addr);
+            } else {
+                rr.push_back(addr);
+            }
+
+            if let Some(pkt) = picked {
+                batch.push(pkt);
+            }
         }
 
         if batch.is_empty() {
