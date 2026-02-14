@@ -28,6 +28,8 @@ const DEFAULT_DROP_RATE: f64 = 0.03;
 const DEFAULT_PROXY_QUEUE_CAPACITY: usize = 96;
 const DEFAULT_PROXY_TELEMETRY_QUEUE_CAPACITY: usize = 48;
 const DEFAULT_PROXY_CRITICAL_QUEUE_CAPACITY: usize = 64;
+const DEFAULT_PROXY_WORKERS: usize = 1;
+const DEFAULT_PROXY_BATCH_SIZE: usize = 32;
 const DEFAULT_PROXY_CRITICAL_BLOCK_TIMEOUT_MILLIS: u64 = 5;
 const DEFAULT_PROXY_DOWNSTREAM_TELEMETRY_TTL_MILLIS: u64 = 0;
 const DEFAULT_PROXY_DOWNSTREAM_CRITICAL_TTL_MILLIS: u64 = 0;
@@ -74,6 +76,8 @@ struct SimArgs {
     max_packets_per_tick: usize,
     jitter_ms: u64,
     drop_rate: f64,
+    proxy_workers: usize,
+    proxy_batch_size: usize,
     proxy_queue_capacity: usize,
     proxy_telemetry_queue_capacity: usize,
     proxy_critical_queue_capacity: usize,
@@ -646,12 +650,14 @@ fn render_json(args: &SimArgs, runs: &[RunRecord]) -> String {
     let mut out = String::new();
     out.push('{');
     out.push_str(&format!(
-        "\"scenario\":\"{}\",\"compare_order\":\"{}\",\"warmup_secs\":{},\"repeats\":{},\"output\":\"{}\",\"runs\":[",
+        "\"scenario\":\"{}\",\"compare_order\":\"{}\",\"warmup_secs\":{},\"repeats\":{},\"output\":\"{}\",\"proxy_workers\":{},\"proxy_batch_size\":{},\"runs\":[",
         scenario_label(args.scenario),
         compare_order_label(args.compare_order),
         args.warmup_secs,
         args.repeats,
-        output_label(args.output)
+        output_label(args.output),
+        args.proxy_workers,
+        args.proxy_batch_size,
     ));
 
     for (idx, run) in runs.iter().enumerate() {
@@ -1342,10 +1348,10 @@ fn proxy_config(
         proxy: ProxySection {
             listen_addr,
             upstream_addr,
-            worker_count: 1,
+            worker_count: args.proxy_workers,
             reuse_port: true,
             pin_workers: false,
-            batch_size: 32,
+            batch_size: args.proxy_batch_size,
             max_sessions: 4096,
             min_datagram_bytes: 1,
             max_datagram_bytes: 1400,
@@ -1823,6 +1829,8 @@ fn parse_args() -> Result<SimArgs, String> {
     let mut max_packets_per_tick = DEFAULT_MAX_PACKETS_PER_TICK;
     let mut jitter_ms = DEFAULT_JITTER_MS;
     let mut drop_rate = DEFAULT_DROP_RATE;
+    let mut proxy_workers = DEFAULT_PROXY_WORKERS;
+    let mut proxy_batch_size = DEFAULT_PROXY_BATCH_SIZE;
     let mut proxy_queue_capacity = DEFAULT_PROXY_QUEUE_CAPACITY;
     let mut proxy_telemetry_queue_capacity = DEFAULT_PROXY_TELEMETRY_QUEUE_CAPACITY;
     let mut proxy_critical_queue_capacity = DEFAULT_PROXY_CRITICAL_QUEUE_CAPACITY;
@@ -1951,6 +1959,16 @@ fn parse_args() -> Result<SimArgs, String> {
                     .parse::<f64>()
                     .map_err(|err| format!("invalid --drop-rate '{v}': {err}"))?;
             }
+            "--proxy-workers" | "--proxy-worker-count" => {
+                proxy_workers = v
+                    .parse::<usize>()
+                    .map_err(|err| format!("invalid {k} '{v}': {err}"))?;
+            }
+            "--proxy-batch-size" => {
+                proxy_batch_size = v
+                    .parse::<usize>()
+                    .map_err(|err| format!("invalid --proxy-batch-size '{v}': {err}"))?;
+            }
             "--proxy-queue-capacity" => {
                 proxy_queue_capacity = v
                     .parse::<usize>()
@@ -2017,6 +2035,12 @@ fn parse_args() -> Result<SimArgs, String> {
     if !(0.0..=1.0).contains(&drop_rate) {
         return Err("--drop-rate must be in [0, 1]".to_string());
     }
+    if proxy_workers == 0 {
+        return Err("--proxy-workers must be > 0".to_string());
+    }
+    if proxy_batch_size == 0 {
+        return Err("--proxy-batch-size must be > 0".to_string());
+    }
     if proxy_queue_capacity == 0
         || proxy_telemetry_queue_capacity == 0
         || proxy_critical_queue_capacity == 0
@@ -2054,6 +2078,8 @@ fn parse_args() -> Result<SimArgs, String> {
         max_packets_per_tick,
         jitter_ms,
         drop_rate,
+        proxy_workers,
+        proxy_batch_size,
         proxy_queue_capacity,
         proxy_telemetry_queue_capacity,
         proxy_critical_queue_capacity,
@@ -2089,6 +2115,8 @@ fn print_help() {
          \t--server-max-packets-per-tick=80\n\
          \t--jitter-ms=30\n\
          \t--drop-rate=0.03\n\
+         \t--proxy-workers=1\n\
+         \t--proxy-batch-size=32\n\
          \t--proxy-queue-capacity=96\n\
          \t--proxy-telemetry-queue-capacity=48\n\
          \t--proxy-critical-queue-capacity=64\n\
