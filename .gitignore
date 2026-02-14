@@ -13,6 +13,7 @@ crates/nx_fuzz/artifacts/
 nx_eos_sim_*.json
 nx_eos_sim_*.csv
 nx_eos_sim_*.txt
+nx_eos_sim_*.log
 
 # CMake / build outputs
 /build/
