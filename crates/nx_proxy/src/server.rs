@@ -641,7 +641,7 @@ async fn run_session_worker(
                     &downstream_telemetry_tap,
                     critical_policy,
                     critical_timeout,
-                    true,
+                    false,
                     &metrics,
                     "upstream_to_client",
                 ).await;
@@ -787,12 +787,22 @@ async fn enqueue_laned<T>(
                 // Never block the hot ingress path (worker thread) on per-session backpressure.
                 // Blocking here causes cross-session head-of-line blocking and tail-latency spikes.
                 if !allow_blocking {
+                    // If we can't block, prioritize freshness: drop one oldest and try again.
                     match critical_tx.try_send(item) {
                         Ok(_) => QueueOutcome::Enqueued,
                         Err(TrySendError::Disconnected(_)) => QueueOutcome::Disconnected,
-                        Err(TrySendError::Full(_)) => QueueOutcome::Dropped {
-                            reason: "queue_full_critical",
-                        },
+                        Err(TrySendError::Full(item)) => {
+                            let _ = critical_tap_rx.try_recv();
+                            match critical_tx.try_send(item) {
+                                Ok(_) => QueueOutcome::DroppedOldestEnqueued {
+                                    reason: "queue_full_critical",
+                                },
+                                Err(TrySendError::Full(_)) => QueueOutcome::Dropped {
+                                    reason: "queue_full_critical",
+                                },
+                                Err(TrySendError::Disconnected(_)) => QueueOutcome::Disconnected,
+                            }
+                        }
                     }
                 } else {
                     match tokio::time::timeout(critical_timeout, critical_tx.send_async(item)).await
