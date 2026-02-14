@@ -1359,9 +1359,7 @@ fn proxy_config(
             downstream_critical_ttl_millis: args.proxy_downstream_critical_ttl_millis,
             telemetry_prefixes: vec!["TELE:".to_string()],
             telemetry_prefixes_upstream: Vec::new(),
-            // In this simulator, SNAP packets are server->client state updates; treat them as
-            // telemetry so they can be aggressively load-shed (drop-oldest/TTL) for stability.
-            telemetry_prefixes_downstream: vec!["TELE:".to_string(), "SNAP ".to_string()],
+            telemetry_prefixes_downstream: Vec::new(),
         },
         rate_limit: RateLimitSection {
             per_ip_packets_per_second: 500_000.0,
