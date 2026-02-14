@@ -1818,7 +1818,7 @@ fn parse_args() -> Result<SimArgs, String> {
     let mut proxy_queue_capacity = DEFAULT_PROXY_QUEUE_CAPACITY;
     let mut proxy_telemetry_queue_capacity = DEFAULT_PROXY_TELEMETRY_QUEUE_CAPACITY;
     let mut proxy_critical_queue_capacity = DEFAULT_PROXY_CRITICAL_QUEUE_CAPACITY;
-    let mut proxy_critical_overflow_policy = CriticalOverflowPolicy::DropNewest;
+    let mut proxy_critical_overflow_policy = CriticalOverflowPolicy::DropOldest;
     let mut proxy_critical_block_timeout_millis = DEFAULT_PROXY_CRITICAL_BLOCK_TIMEOUT_MILLIS;
 
     for raw in env::args().skip(1) {

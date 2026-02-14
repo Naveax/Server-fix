@@ -611,7 +611,7 @@ fn proxy_config(
             queue_capacity: 64,
             telemetry_queue_capacity: Some(32),
             critical_queue_capacity: Some(32),
-            critical_overflow_policy: CriticalOverflowPolicy::DropNewest,
+            critical_overflow_policy: CriticalOverflowPolicy::DropOldest,
             critical_block_timeout_millis: 5,
             telemetry_prefixes: vec!["TELE:".to_string()],
         },

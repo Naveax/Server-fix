@@ -40,6 +40,9 @@ ctest --test-dir build --output-on-failure
 - `config/example.toml`: production-oriented template.
 - `config/dev.toml`: local development defaults.
 - Per-IP token bucket shortcut: `[rate_limit].ddos_limit = 500.0`.
+- Queue/backpressure defaults in the templates are tuned for freshness under overload:
+  - `[proxy].critical_overflow_policy = "drop_oldest"` (prefer newest control/state; avoid stale backlog).
+  - Keep `[proxy].telemetry_queue_capacity` smaller than `[proxy].critical_queue_capacity` to prevent telemetry from consuming queue budget.
 - Anomaly controls: `[anomaly]` with `anomaly_threshold`, `client_sync_check`, and `model`.
 - Packet integrity controls: `[packet_validation]` with `strict_mode` and `require_checksum`.
 - MMR/smurf controls: `[mmr]` with `mmr_threshold = 0.8` and optional Torch model path.

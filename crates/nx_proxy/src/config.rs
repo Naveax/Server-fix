@@ -281,8 +281,8 @@ pub struct MetricsSection {
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum CriticalOverflowPolicy {
-    #[default]
     DropNewest,
+    #[default]
     DropOldest,
     BlockWithTimeout,
 }

@@ -10,10 +10,10 @@ min_datagram_bytes = 1
 max_datagram_bytes = 1400
 drop_udp_fragments = true
 # best-effort: exact fragment detection may not be available via standard UDP socket APIs
-queue_capacity = 256
-telemetry_queue_capacity = 256
-critical_queue_capacity = 128
-critical_overflow_policy = "drop_newest"
+queue_capacity = 128
+telemetry_queue_capacity = 32
+critical_queue_capacity = 96
+critical_overflow_policy = "drop_oldest"
 critical_block_timeout_millis = 5
 telemetry_prefixes = ["TELE:", "STAT:"]
 
