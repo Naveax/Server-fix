@@ -616,6 +616,8 @@ fn proxy_config(
             downstream_telemetry_ttl_millis: 0,
             downstream_critical_ttl_millis: 0,
             telemetry_prefixes: vec!["TELE:".to_string()],
+            telemetry_prefixes_upstream: Vec::new(),
+            telemetry_prefixes_downstream: Vec::new(),
         },
         rate_limit: RateLimitSection {
             per_ip_packets_per_second: 200_000.0,

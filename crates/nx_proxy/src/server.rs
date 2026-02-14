@@ -265,7 +265,8 @@ async fn run_worker(
         } else {
             0
         };
-    let telemetry_prefixes = Arc::new(config.proxy.telemetry_prefix_bytes());
+    let telemetry_prefixes_upstream = Arc::new(config.proxy.telemetry_prefix_bytes_upstream());
+    let telemetry_prefixes_downstream = Arc::new(config.proxy.telemetry_prefix_bytes_downstream());
     let critical_queue_capacity = config.proxy.critical_queue_capacity();
     let telemetry_queue_capacity = config.proxy.telemetry_queue_capacity();
     let critical_timeout = Duration::from_millis(config.proxy.critical_block_timeout_millis);
@@ -434,7 +435,7 @@ async fn run_worker(
                             downstream_critical_tap.clone(),
                             downstream_telemetry_tx.clone(),
                             downstream_telemetry_tap.clone(),
-                            Arc::clone(&telemetry_prefixes),
+                            Arc::clone(&telemetry_prefixes_downstream),
                             metrics.clone(),
                             shutdown.child_token(),
                             config.proxy.max_datagram_bytes,
@@ -458,7 +459,7 @@ async fn run_worker(
                     };
                     session.last_seen = Instant::now();
 
-                    let lane = classify_lane(payload, &telemetry_prefixes);
+                    let lane = classify_lane(payload, &telemetry_prefixes_upstream);
                     let queue_result = {
                         let payload = payload.to_vec();
                         enqueue_laned(

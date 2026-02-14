@@ -60,6 +60,14 @@ pub struct ProxySection {
     pub downstream_critical_ttl_millis: u64,
     #[serde(default)]
     pub telemetry_prefixes: Vec<String>,
+    /// Optional: override telemetry classification per direction.
+    /// If empty, falls back to `telemetry_prefixes`.
+    #[serde(default)]
+    pub telemetry_prefixes_upstream: Vec<String>,
+    /// Optional: override telemetry classification per direction.
+    /// If empty, falls back to `telemetry_prefixes`.
+    #[serde(default)]
+    pub telemetry_prefixes_downstream: Vec<String>,
 }
 
 impl ProxySection {
@@ -76,12 +84,32 @@ impl ProxySection {
     }
 
     pub fn telemetry_prefix_bytes(&self) -> Vec<Vec<u8>> {
-        self.telemetry_prefixes
-            .iter()
-            .filter(|prefix| !prefix.is_empty())
-            .map(|prefix| prefix.as_bytes().to_vec())
-            .collect()
+        prefix_bytes(&self.telemetry_prefixes)
     }
+
+    pub fn telemetry_prefix_bytes_upstream(&self) -> Vec<Vec<u8>> {
+        if self.telemetry_prefixes_upstream.is_empty() {
+            self.telemetry_prefix_bytes()
+        } else {
+            prefix_bytes(&self.telemetry_prefixes_upstream)
+        }
+    }
+
+    pub fn telemetry_prefix_bytes_downstream(&self) -> Vec<Vec<u8>> {
+        if self.telemetry_prefixes_downstream.is_empty() {
+            self.telemetry_prefix_bytes()
+        } else {
+            prefix_bytes(&self.telemetry_prefixes_downstream)
+        }
+    }
+}
+
+fn prefix_bytes(prefixes: &[String]) -> Vec<Vec<u8>> {
+    prefixes
+        .iter()
+        .filter(|prefix| !prefix.is_empty())
+        .map(|prefix| prefix.as_bytes().to_vec())
+        .collect()
 }
 
 #[derive(Debug, Clone, Deserialize)]
