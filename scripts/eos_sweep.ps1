@@ -34,19 +34,32 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+function Resolve-OutDir {
+  param([string]$Path)
+  if ([System.IO.Path]::IsPathRooted($Path)) {
+    return $Path
+  }
+  return (Join-Path $repoRoot $Path)
+}
+
 if ($WarmupSecs -ge $DurationSecs) {
   throw "--WarmupSecs must be smaller than --DurationSecs"
 }
 
-New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
+# Ensure we run from repo root even if invoked from elsewhere.
+$repoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
+$outDirPath = Resolve-OutDir $OutDir
+New-Item -ItemType Directory -Force -Path $outDirPath | Out-Null
 
-Write-Host "Building nx_eos_sim (release) ..."
-cargo build --release -p nx_proxy --bin nx_eos_sim | Out-Host
+Push-Location $repoRoot
+try {
+  Write-Host "Building nx_eos_sim (release) ..."
+  cargo build --release -p nx_proxy --bin nx_eos_sim | Out-Host
 
-$exe = Join-Path (Get-Location) "target\\release\\nx_eos_sim.exe"
-if (-not (Test-Path $exe)) {
-  throw "missing binary: $exe"
-}
+  $exe = Join-Path $repoRoot "target\\release\\nx_eos_sim.exe"
+  if (-not (Test-Path $exe)) {
+    throw "missing binary: $exe"
+  }
 
 function Invoke-Sim {
   param(
@@ -58,7 +71,7 @@ function Invoke-Sim {
   )
 
   $name = "nx_eos_sim_sweep_b${BatchSize}_dq${DownTele}_${DownCrit}_ttl${TtlTele}_${TtlCrit}.json"
-  $outPath = Join-Path $OutDir $name
+  $outPath = Join-Path $outDirPath $name
 
   $args = @(
     "--scenario=compare",
@@ -138,8 +151,10 @@ Write-Host ""
 Write-Host "Top results (most stable first):"
 $sorted | Select-Object -First 15 | Format-Table -AutoSize
 
-$csvPath = Join-Path $OutDir $OutCsv
+$csvPath = Join-Path $outDirPath $OutCsv
 $sorted | Export-Csv -NoTypeInformation -Encoding UTF8 -Delimiter ';' -Path $csvPath
 Write-Host ""
 Write-Host "Wrote: $csvPath"
-
+} finally {
+  Pop-Location
+}
