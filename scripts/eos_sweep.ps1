@@ -9,7 +9,12 @@ param(
   [double]$DropRate = 0.03,
 
   [int]$ProxyWorkers = 1,
-  [int[]]$ProxyBatchSizes = @(32, 64),
+  # NOTE: use string[] + custom parsing so both:
+  #   powershell -File ... -ProxyBatchSizes 32,64
+  # and:
+  #   .\\scripts\\eos_sweep.ps1 -ProxyBatchSizes 32,64
+  # behave the same.
+  [string[]]$ProxyBatchSizes = @("32", "64"),
 
   # Upstream (client->server) per-session queues.
   [int]$ProxyQueueCapacity = 128,
@@ -21,18 +26,48 @@ param(
 
   # Downstream (server->client) shared queues.
   # If you omit these, nx_proxy will fall back to the upstream capacities above.
-  [int[]]$DownstreamTelemetryCaps = @(64, 128, 256),
-  [int[]]$DownstreamCriticalCaps = @(128, 256, 512),
+  [string[]]$DownstreamTelemetryCaps = @("64", "128", "256"),
+  [string[]]$DownstreamCriticalCaps = @("128", "256", "512"),
 
   # Load-shedding: drop stale packets from downstream queue (0 disables).
-  [int[]]$DownstreamTelemetryTtlMs = @(100),
-  [int[]]$DownstreamCriticalTtlMs = @(250),
+  [string[]]$DownstreamTelemetryTtlMs = @("100"),
+  [string[]]$DownstreamCriticalTtlMs = @("250"),
 
   [string]$OutDir = ".",
   [string]$OutCsv = "nx_eos_sim_sweep.csv"
 )
 
 $ErrorActionPreference = "Stop"
+
+function Parse-IntList {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string[]]$Values,
+    [Parameter(Mandatory = $true)]
+    [string]$Name
+  )
+
+  $out = New-Object "System.Collections.Generic.List[int]"
+  foreach ($v in $Values) {
+    if ([string]::IsNullOrWhiteSpace($v)) {
+      continue
+    }
+
+    foreach ($tok in ($v -split "[,;\\s]+")) {
+      if ([string]::IsNullOrWhiteSpace($tok)) {
+        continue
+      }
+
+      $n = 0
+      if (-not [int]::TryParse($tok, [ref]$n)) {
+        throw "Invalid integer in -${Name}: '$tok' (from '$v')"
+      }
+      $out.Add($n)
+    }
+  }
+
+  return $out.ToArray()
+}
 
 function Resolve-OutDir {
   param([string]$Path)
@@ -45,6 +80,24 @@ function Resolve-OutDir {
 if ($WarmupSecs -ge $DurationSecs) {
   throw "--WarmupSecs must be smaller than --DurationSecs"
 }
+
+$proxyBatchSizesI = Parse-IntList -Values $ProxyBatchSizes -Name "ProxyBatchSizes"
+$downTeleCapsI = Parse-IntList -Values $DownstreamTelemetryCaps -Name "DownstreamTelemetryCaps"
+$downCritCapsI = Parse-IntList -Values $DownstreamCriticalCaps -Name "DownstreamCriticalCaps"
+$ttlTeleMsI = Parse-IntList -Values $DownstreamTelemetryTtlMs -Name "DownstreamTelemetryTtlMs"
+$ttlCritMsI = Parse-IntList -Values $DownstreamCriticalTtlMs -Name "DownstreamCriticalTtlMs"
+
+if ($proxyBatchSizesI.Count -eq 0) { throw "-ProxyBatchSizes must not be empty" }
+if ($downTeleCapsI.Count -eq 0) { throw "-DownstreamTelemetryCaps must not be empty" }
+if ($downCritCapsI.Count -eq 0) { throw "-DownstreamCriticalCaps must not be empty" }
+if ($ttlTeleMsI.Count -eq 0) { throw "-DownstreamTelemetryTtlMs must not be empty" }
+if ($ttlCritMsI.Count -eq 0) { throw "-DownstreamCriticalTtlMs must not be empty" }
+
+if ($proxyBatchSizesI | Where-Object { $_ -le 0 }) { throw "-ProxyBatchSizes must be > 0" }
+if ($downTeleCapsI | Where-Object { $_ -le 0 }) { throw "-DownstreamTelemetryCaps must be > 0" }
+if ($downCritCapsI | Where-Object { $_ -le 0 }) { throw "-DownstreamCriticalCaps must be > 0" }
+if ($ttlTeleMsI | Where-Object { $_ -lt 0 }) { throw "-DownstreamTelemetryTtlMs must be >= 0" }
+if ($ttlCritMsI | Where-Object { $_ -lt 0 }) { throw "-DownstreamCriticalTtlMs must be >= 0" }
 
 # Ensure we run from repo root even if invoked from elsewhere.
 $repoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
@@ -129,11 +182,11 @@ function Invoke-Sim {
 }
 
 $rows = @()
-foreach ($batch in $ProxyBatchSizes) {
-  foreach ($dqT in $DownstreamTelemetryCaps) {
-    foreach ($dqC in $DownstreamCriticalCaps) {
-      foreach ($ttlT in $DownstreamTelemetryTtlMs) {
-        foreach ($ttlC in $DownstreamCriticalTtlMs) {
+foreach ($batch in $proxyBatchSizesI) {
+  foreach ($dqT in $downTeleCapsI) {
+    foreach ($dqC in $downCritCapsI) {
+      foreach ($ttlT in $ttlTeleMsI) {
+        foreach ($ttlC in $ttlCritMsI) {
           $rows += Invoke-Sim -BatchSize $batch -DownTele $dqT -DownCrit $dqC -TtlTele $ttlT -TtlCrit $ttlC
         }
       }
