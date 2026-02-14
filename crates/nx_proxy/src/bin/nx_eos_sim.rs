@@ -81,6 +81,8 @@ struct SimArgs {
     proxy_queue_capacity: usize,
     proxy_telemetry_queue_capacity: usize,
     proxy_critical_queue_capacity: usize,
+    proxy_downstream_telemetry_queue_capacity: Option<usize>,
+    proxy_downstream_critical_queue_capacity: Option<usize>,
     proxy_critical_overflow_policy: CriticalOverflowPolicy,
     proxy_critical_block_timeout_millis: u64,
     proxy_downstream_telemetry_ttl_millis: u64,
@@ -1359,6 +1361,8 @@ fn proxy_config(
             queue_capacity: args.proxy_queue_capacity,
             telemetry_queue_capacity: Some(args.proxy_telemetry_queue_capacity),
             critical_queue_capacity: Some(args.proxy_critical_queue_capacity),
+            downstream_telemetry_queue_capacity: args.proxy_downstream_telemetry_queue_capacity,
+            downstream_critical_queue_capacity: args.proxy_downstream_critical_queue_capacity,
             critical_overflow_policy: args.proxy_critical_overflow_policy,
             critical_block_timeout_millis: args.proxy_critical_block_timeout_millis,
             downstream_telemetry_ttl_millis: args.proxy_downstream_telemetry_ttl_millis,
@@ -1834,6 +1838,8 @@ fn parse_args() -> Result<SimArgs, String> {
     let mut proxy_queue_capacity = DEFAULT_PROXY_QUEUE_CAPACITY;
     let mut proxy_telemetry_queue_capacity = DEFAULT_PROXY_TELEMETRY_QUEUE_CAPACITY;
     let mut proxy_critical_queue_capacity = DEFAULT_PROXY_CRITICAL_QUEUE_CAPACITY;
+    let mut proxy_downstream_telemetry_queue_capacity: Option<usize> = None;
+    let mut proxy_downstream_critical_queue_capacity: Option<usize> = None;
     let mut proxy_critical_overflow_policy = CriticalOverflowPolicy::DropOldest;
     let mut proxy_critical_block_timeout_millis = DEFAULT_PROXY_CRITICAL_BLOCK_TIMEOUT_MILLIS;
     let mut proxy_downstream_telemetry_ttl_millis = DEFAULT_PROXY_DOWNSTREAM_TELEMETRY_TTL_MILLIS;
@@ -1984,6 +1990,28 @@ fn parse_args() -> Result<SimArgs, String> {
                     format!("invalid --proxy-critical-queue-capacity '{v}': {err}")
                 })?;
             }
+            "--proxy-downstream-telemetry-queue-capacity" => {
+                let cap = v.parse::<usize>().map_err(|err| {
+                    format!("invalid --proxy-downstream-telemetry-queue-capacity '{v}': {err}")
+                })?;
+                if cap == 0 {
+                    return Err(
+                        "--proxy-downstream-telemetry-queue-capacity must be > 0".to_string()
+                    );
+                }
+                proxy_downstream_telemetry_queue_capacity = Some(cap);
+            }
+            "--proxy-downstream-critical-queue-capacity" => {
+                let cap = v.parse::<usize>().map_err(|err| {
+                    format!("invalid --proxy-downstream-critical-queue-capacity '{v}': {err}")
+                })?;
+                if cap == 0 {
+                    return Err(
+                        "--proxy-downstream-critical-queue-capacity must be > 0".to_string()
+                    );
+                }
+                proxy_downstream_critical_queue_capacity = Some(cap);
+            }
             "--proxy-critical-overflow" => {
                 proxy_critical_overflow_policy =
                     parse_critical_overflow_policy(v).ok_or_else(|| {
@@ -2083,6 +2111,8 @@ fn parse_args() -> Result<SimArgs, String> {
         proxy_queue_capacity,
         proxy_telemetry_queue_capacity,
         proxy_critical_queue_capacity,
+        proxy_downstream_telemetry_queue_capacity,
+        proxy_downstream_critical_queue_capacity,
         proxy_critical_overflow_policy,
         proxy_critical_block_timeout_millis,
         proxy_downstream_telemetry_ttl_millis,
@@ -2120,6 +2150,8 @@ fn print_help() {
          \t--proxy-queue-capacity=96\n\
          \t--proxy-telemetry-queue-capacity=48\n\
          \t--proxy-critical-queue-capacity=64\n\
+         \t--proxy-downstream-telemetry-queue-capacity=48 (optional; defaults to proxy-telemetry-queue-capacity)\n\
+         \t--proxy-downstream-critical-queue-capacity=64 (optional; defaults to proxy-critical-queue-capacity)\n\
          \t--proxy-critical-overflow=drop-newest|drop-oldest|block-with-timeout\n\
          \t--proxy-critical-block-timeout-ms=5\n\
          \t--proxy-downstream-telemetry-ttl-ms=0\n\

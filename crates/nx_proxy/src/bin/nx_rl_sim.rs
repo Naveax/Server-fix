@@ -611,6 +611,8 @@ fn proxy_config(
             queue_capacity: 64,
             telemetry_queue_capacity: Some(32),
             critical_queue_capacity: Some(32),
+            downstream_telemetry_queue_capacity: None,
+            downstream_critical_queue_capacity: None,
             critical_overflow_policy: CriticalOverflowPolicy::DropOldest,
             critical_block_timeout_millis: 5,
             downstream_telemetry_ttl_millis: 0,

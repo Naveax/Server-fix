@@ -269,12 +269,15 @@ async fn run_worker(
     let telemetry_prefixes_downstream = Arc::new(config.proxy.telemetry_prefix_bytes_downstream());
     let critical_queue_capacity = config.proxy.critical_queue_capacity();
     let telemetry_queue_capacity = config.proxy.telemetry_queue_capacity();
+    let downstream_critical_queue_capacity = config.proxy.downstream_critical_queue_capacity();
+    let downstream_telemetry_queue_capacity = config.proxy.downstream_telemetry_queue_capacity();
     let critical_timeout = Duration::from_millis(config.proxy.critical_block_timeout_millis);
 
-    let (downstream_critical_tx, downstream_critical_rx) = flume::bounded(critical_queue_capacity);
+    let (downstream_critical_tx, downstream_critical_rx) =
+        flume::bounded(downstream_critical_queue_capacity);
     let downstream_critical_tap = downstream_critical_rx.clone();
     let (downstream_telemetry_tx, downstream_telemetry_rx) =
-        flume::bounded(telemetry_queue_capacity);
+        flume::bounded(downstream_telemetry_queue_capacity);
     let downstream_telemetry_tap = downstream_telemetry_rx.clone();
 
     let downstream_task = {

@@ -48,6 +48,14 @@ pub struct ProxySection {
     pub telemetry_queue_capacity: Option<usize>,
     #[serde(default)]
     pub critical_queue_capacity: Option<usize>,
+    /// Optional: downstream (upstream->client) telemetry queue capacity override.
+    /// If unset, falls back to `telemetry_queue_capacity` then `queue_capacity`.
+    #[serde(default)]
+    pub downstream_telemetry_queue_capacity: Option<usize>,
+    /// Optional: downstream (upstream->client) critical queue capacity override.
+    /// If unset, falls back to `critical_queue_capacity` then `queue_capacity`.
+    #[serde(default)]
+    pub downstream_critical_queue_capacity: Option<usize>,
     #[serde(default)]
     pub critical_overflow_policy: CriticalOverflowPolicy,
     #[serde(default = "default_critical_block_timeout_millis")]
@@ -79,6 +87,20 @@ impl ProxySection {
 
     pub fn critical_queue_capacity(&self) -> usize {
         self.critical_queue_capacity
+            .unwrap_or(self.queue_capacity)
+            .max(1)
+    }
+
+    pub fn downstream_telemetry_queue_capacity(&self) -> usize {
+        self.downstream_telemetry_queue_capacity
+            .or(self.telemetry_queue_capacity)
+            .unwrap_or(self.queue_capacity)
+            .max(1)
+    }
+
+    pub fn downstream_critical_queue_capacity(&self) -> usize {
+        self.downstream_critical_queue_capacity
+            .or(self.critical_queue_capacity)
             .unwrap_or(self.queue_capacity)
             .max(1)
     }
@@ -776,6 +798,8 @@ listen_addr = "127.0.0.1:9200"
         assert_eq!(parsed.proxy.max_sessions, 4096);
         assert_eq!(parsed.proxy.telemetry_queue_capacity(), 32);
         assert_eq!(parsed.proxy.critical_queue_capacity(), 16);
+        assert_eq!(parsed.proxy.downstream_telemetry_queue_capacity(), 32);
+        assert_eq!(parsed.proxy.downstream_critical_queue_capacity(), 16);
         assert!(parsed.cookie.enabled);
         assert_eq!(parsed.cookie.token_ttl_secs, 30);
         assert_eq!(parsed.metrics.listen_addr.to_string(), "127.0.0.1:9200");

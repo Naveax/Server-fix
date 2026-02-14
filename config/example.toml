@@ -13,6 +13,10 @@ drop_udp_fragments = true
 queue_capacity = 128
 telemetry_queue_capacity = 32
 critical_queue_capacity = 96
+# Optional: if set, these override only the downstream (upstream->client) queues.
+# Useful when you want small per-session upstream queues but a larger shared downstream buffer.
+#downstream_telemetry_queue_capacity = 32
+#downstream_critical_queue_capacity = 96
 critical_overflow_policy = "drop_oldest"
 critical_block_timeout_millis = 5
 # Optional load-shedding: drop packets that wait too long in the downstream queue.

@@ -305,6 +305,8 @@ fn base_config(
             queue_capacity: 16,
             telemetry_queue_capacity: Some(8),
             critical_queue_capacity: Some(8),
+            downstream_telemetry_queue_capacity: None,
+            downstream_critical_queue_capacity: None,
             critical_overflow_policy: CriticalOverflowPolicy::DropNewest,
             critical_block_timeout_millis: 10,
             downstream_telemetry_ttl_millis: 0,
