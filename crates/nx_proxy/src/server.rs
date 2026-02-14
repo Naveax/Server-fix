@@ -50,12 +50,6 @@ enum QueueOutcome {
     Disconnected,
 }
 
-#[derive(Debug)]
-struct InboundPacket {
-    client_addr: SocketAddr,
-    payload: Vec<u8>,
-}
-
 struct IngressIo {
     bufs: Vec<MsgBuf>,
     #[cfg(all(feature = "netio_mmsg", target_os = "linux"))]
@@ -74,11 +68,7 @@ impl IngressIo {
         }
     }
 
-    async fn recv(
-        &mut self,
-        socket: &UdpSocket,
-        metrics: &ProxyMetrics,
-    ) -> io::Result<Vec<InboundPacket>> {
+    async fn recv(&mut self, socket: &UdpSocket, metrics: &ProxyMetrics) -> io::Result<usize> {
         #[cfg(all(feature = "netio_mmsg", target_os = "linux"))]
         {
             loop {
@@ -91,9 +81,9 @@ impl IngressIo {
                 }) {
                     Ok(n) if n > 0 => {
                         metrics.record_udp_netio_recv_batch(n);
-                        return Ok(self.collect(n));
+                        return Ok(n);
                     }
-                    Ok(_) => return Ok(Vec::new()),
+                    Ok(_) => return Ok(0),
                     Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
                         socket.readable().await?;
                     }
@@ -107,18 +97,7 @@ impl IngressIo {
         let _ = metrics;
 
         let n = nx_netio::recv_batch_tokio(socket, &mut self.bufs).await?;
-        Ok(self.collect(n))
-    }
-
-    fn collect(&self, n: usize) -> Vec<InboundPacket> {
-        let mut out = Vec::with_capacity(n);
-        for msg in self.bufs.iter().take(n) {
-            out.push(InboundPacket {
-                client_addr: msg.addr(),
-                payload: msg.payload().to_vec(),
-            });
-        }
-        out
+        Ok(n)
     }
 }
 
@@ -329,8 +308,8 @@ async fn run_worker(
                 });
             }
             recv = ingress_io.recv(&client_socket, &metrics) => {
-                let packets = match recv {
-                    Ok(packets) => packets,
+                let packet_count = match recv {
+                    Ok(count) => count,
                     Err(_) => {
                         metrics.record_udp_drop("udp_recv_error");
                         metrics.record_drop("client_recv_error");
@@ -338,15 +317,18 @@ async fn run_worker(
                     }
                 };
 
-                for inbound in packets {
+                for msg in ingress_io.bufs.iter().take(packet_count) {
                     metrics.record_udp_packet_in();
-                    if inbound.payload.is_empty() {
+                    let client_addr = msg.addr();
+                    let raw_packet = msg.payload();
+
+                    if raw_packet.is_empty() {
                         metrics.record_udp_drop("packet_empty");
                         metrics.record_drop("packet_empty");
                         continue;
                     }
 
-                    if inbound.payload.len() > max_wire_packet_size {
+                    if raw_packet.len() > max_wire_packet_size {
                         metrics.record_udp_drop("packet_too_large");
                         metrics.record_drop("packet_too_large");
                         continue;
@@ -359,7 +341,7 @@ async fn run_worker(
                     }
 
                     let now_secs = now_unix_secs();
-                    let payload = match challenge_gate.evaluate(inbound.client_addr, &inbound.payload, now_secs) {
+                    let payload = match challenge_gate.evaluate(client_addr, raw_packet, now_secs) {
                         GateDecision::Forward(payload) => payload,
                         GateDecision::ForwardVerified(payload) => {
                             metrics.record_challenge_verified();
@@ -367,7 +349,11 @@ async fn run_worker(
                         }
                         GateDecision::Challenge(challenge_packet) => {
                             metrics.record_challenge_issued();
-                            if client_socket.send_to(&challenge_packet, inbound.client_addr).await.is_err() {
+                            if client_socket
+                                .send_to(&challenge_packet, client_addr)
+                                .await
+                                .is_err()
+                            {
                                 metrics.record_udp_drop("cookie_challenge_send_error");
                                 metrics.record_drop("challenge_send_error");
                             }
@@ -389,7 +375,7 @@ async fn run_worker(
                         }
                     };
 
-                    if let Err(scope) = rate_limiter.allow(inbound.client_addr.ip(), payload.len()) {
+                    if let Err(scope) = rate_limiter.allow(client_addr.ip(), payload.len()) {
                         metrics.record_udp_rate_limited(scope.as_label());
                         metrics.record_udp_drop("udp_rate_limited");
                         metrics.record_rate_limit_drop();
@@ -401,7 +387,7 @@ async fn run_worker(
                     let now = Instant::now();
 
                     if anomaly_detector
-                        .check_anomaly_with_payload(inbound.client_addr.ip(), payload, now)
+                        .check_anomaly_with_payload(client_addr.ip(), payload, now)
                         .is_some()
                     {
                         metrics.record_udp_drop("anomaly_suspected");
@@ -411,7 +397,7 @@ async fn run_worker(
                     }
 
                     if mmr_detector
-                        .check_smurf_with_payload(inbound.client_addr.ip(), payload, now)
+                        .check_smurf_with_payload(client_addr.ip(), payload, now)
                         .is_some()
                     {
                         metrics.record_udp_drop("mmr_smurf_suspected");
@@ -419,7 +405,7 @@ async fn run_worker(
                         continue;
                     }
 
-                    if !sessions.contains_key(&inbound.client_addr) {
+                    if !sessions.contains_key(&client_addr) {
                         if sessions.len() >= config.proxy.max_sessions {
                             metrics.record_udp_drop("session_limit_reached");
                             metrics.record_drop("session_limit_reached");
@@ -427,7 +413,7 @@ async fn run_worker(
                         }
 
                         let session = match spawn_session(
-                            inbound.client_addr,
+                            client_addr,
                             config.proxy.upstream_addr,
                             critical_queue_capacity,
                             telemetry_queue_capacity,
@@ -442,7 +428,7 @@ async fn run_worker(
                             shutdown.child_token(),
                             config.proxy.max_datagram_bytes,
                         )
-                        .await
+                            .await
                         {
                             Ok(session) => session,
                             Err(_) => {
@@ -451,10 +437,10 @@ async fn run_worker(
                                 continue;
                             }
                         };
-                        sessions.insert(inbound.client_addr, session);
+                        sessions.insert(client_addr, session);
                     }
 
-                    let Some(session) = sessions.get_mut(&inbound.client_addr) else {
+                    let Some(session) = sessions.get_mut(&client_addr) else {
                         metrics.record_udp_drop("session_lookup_error");
                         metrics.record_drop("session_lookup_error");
                         continue;
