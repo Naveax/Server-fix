@@ -116,12 +116,17 @@ async fn telemetry_spam_does_not_starve_critical() {
     );
 
     let metrics = fetch_metrics(metrics_addr);
+    let telemetry_queue_drops = metric_counter_with_labels(
+        &metrics,
+        "nx_proxy_udp_dropped_total",
+        "reason=\"queue_full_telemetry_drop_oldest\"",
+    ) + metric_counter_with_labels(
+        &metrics,
+        "nx_proxy_udp_dropped_total",
+        "reason=\"queue_full_telemetry_drop\"",
+    );
     assert!(
-        metric_counter_with_labels(
-            &metrics,
-            "nx_proxy_udp_dropped_total",
-            "reason=\"queue_full_telemetry\""
-        ) > 0,
+        telemetry_queue_drops > 0,
         "expected telemetry queue drops in metrics:\n{metrics}"
     );
 
@@ -302,6 +307,8 @@ fn base_config(
             critical_queue_capacity: Some(8),
             critical_overflow_policy: CriticalOverflowPolicy::DropNewest,
             critical_block_timeout_millis: 10,
+            downstream_telemetry_ttl_millis: 0,
+            downstream_critical_ttl_millis: 0,
             telemetry_prefixes: vec!["TEL:".to_string()],
         },
         rate_limit: RateLimitSection {

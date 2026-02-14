@@ -52,6 +52,12 @@ pub struct ProxySection {
     pub critical_overflow_policy: CriticalOverflowPolicy,
     #[serde(default = "default_critical_block_timeout_millis")]
     pub critical_block_timeout_millis: u64,
+    // Optional load-shedding: if packets sit in the downstream queue too long, drop them
+    // instead of delivering stale data to clients. 0 disables.
+    #[serde(default)]
+    pub downstream_telemetry_ttl_millis: u64,
+    #[serde(default)]
+    pub downstream_critical_ttl_millis: u64,
     #[serde(default)]
     pub telemetry_prefixes: Vec<String>,
 }

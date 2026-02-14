@@ -29,6 +29,8 @@ const DEFAULT_PROXY_QUEUE_CAPACITY: usize = 96;
 const DEFAULT_PROXY_TELEMETRY_QUEUE_CAPACITY: usize = 48;
 const DEFAULT_PROXY_CRITICAL_QUEUE_CAPACITY: usize = 64;
 const DEFAULT_PROXY_CRITICAL_BLOCK_TIMEOUT_MILLIS: u64 = 5;
+const DEFAULT_PROXY_DOWNSTREAM_TELEMETRY_TTL_MILLIS: u64 = 0;
+const DEFAULT_PROXY_DOWNSTREAM_CRITICAL_TTL_MILLIS: u64 = 0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Scenario {
@@ -77,6 +79,8 @@ struct SimArgs {
     proxy_critical_queue_capacity: usize,
     proxy_critical_overflow_policy: CriticalOverflowPolicy,
     proxy_critical_block_timeout_millis: u64,
+    proxy_downstream_telemetry_ttl_millis: u64,
+    proxy_downstream_critical_ttl_millis: u64,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -1351,6 +1355,8 @@ fn proxy_config(
             critical_queue_capacity: Some(args.proxy_critical_queue_capacity),
             critical_overflow_policy: args.proxy_critical_overflow_policy,
             critical_block_timeout_millis: args.proxy_critical_block_timeout_millis,
+            downstream_telemetry_ttl_millis: args.proxy_downstream_telemetry_ttl_millis,
+            downstream_critical_ttl_millis: args.proxy_downstream_critical_ttl_millis,
             telemetry_prefixes: vec!["TELE:".to_string()],
         },
         rate_limit: RateLimitSection {
@@ -1820,6 +1826,8 @@ fn parse_args() -> Result<SimArgs, String> {
     let mut proxy_critical_queue_capacity = DEFAULT_PROXY_CRITICAL_QUEUE_CAPACITY;
     let mut proxy_critical_overflow_policy = CriticalOverflowPolicy::DropOldest;
     let mut proxy_critical_block_timeout_millis = DEFAULT_PROXY_CRITICAL_BLOCK_TIMEOUT_MILLIS;
+    let mut proxy_downstream_telemetry_ttl_millis = DEFAULT_PROXY_DOWNSTREAM_TELEMETRY_TTL_MILLIS;
+    let mut proxy_downstream_critical_ttl_millis = DEFAULT_PROXY_DOWNSTREAM_CRITICAL_TTL_MILLIS;
 
     for raw in env::args().skip(1) {
         if raw == "--help" || raw == "-h" {
@@ -1969,6 +1977,16 @@ fn parse_args() -> Result<SimArgs, String> {
                     format!("invalid --proxy-critical-block-timeout-ms '{v}': {err}")
                 })?;
             }
+            "--proxy-downstream-telemetry-ttl-ms" => {
+                proxy_downstream_telemetry_ttl_millis = v.parse::<u64>().map_err(|err| {
+                    format!("invalid --proxy-downstream-telemetry-ttl-ms '{v}': {err}")
+                })?;
+            }
+            "--proxy-downstream-critical-ttl-ms" => {
+                proxy_downstream_critical_ttl_millis = v.parse::<u64>().map_err(|err| {
+                    format!("invalid --proxy-downstream-critical-ttl-ms '{v}': {err}")
+                })?;
+            }
             _ => return Err(format!("unknown arg '{k}'. use --help")),
         }
     }
@@ -2039,6 +2057,8 @@ fn parse_args() -> Result<SimArgs, String> {
         proxy_critical_queue_capacity,
         proxy_critical_overflow_policy,
         proxy_critical_block_timeout_millis,
+        proxy_downstream_telemetry_ttl_millis,
+        proxy_downstream_critical_ttl_millis,
     })
 }
 
@@ -2071,6 +2091,8 @@ fn print_help() {
          \t--proxy-telemetry-queue-capacity=48\n\
          \t--proxy-critical-queue-capacity=64\n\
          \t--proxy-critical-overflow=drop-newest|drop-oldest|block-with-timeout\n\
-         \t--proxy-critical-block-timeout-ms=5\n"
+         \t--proxy-critical-block-timeout-ms=5\n\
+         \t--proxy-downstream-telemetry-ttl-ms=0\n\
+         \t--proxy-downstream-critical-ttl-ms=0\n"
     );
 }

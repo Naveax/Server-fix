@@ -15,6 +15,9 @@ telemetry_queue_capacity = 32
 critical_queue_capacity = 96
 critical_overflow_policy = "drop_oldest"
 critical_block_timeout_millis = 5
+# Optional load-shedding: drop packets that wait too long in the downstream queue.
+downstream_telemetry_ttl_millis = 100
+downstream_critical_ttl_millis = 250
 telemetry_prefixes = ["TELE:", "STAT:"]
 
 [rate_limit]

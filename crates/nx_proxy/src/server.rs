@@ -40,6 +40,8 @@ struct SessionHandle {
 struct DownstreamPacket {
     client_addr: SocketAddr,
     payload: Vec<u8>,
+    lane: TrafficLane,
+    enqueued_at: Instant,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -277,6 +279,8 @@ async fn run_worker(
         let socket = Arc::clone(&client_socket);
         let metrics = metrics.clone();
         let shutdown = shutdown.child_token();
+        let critical_ttl = Duration::from_millis(config.proxy.downstream_critical_ttl_millis);
+        let telemetry_ttl = Duration::from_millis(config.proxy.downstream_telemetry_ttl_millis);
         tokio::spawn(async move {
             run_downstream_worker(
                 socket,
@@ -285,6 +289,8 @@ async fn run_worker(
                 metrics,
                 shutdown,
                 config.proxy.batch_size,
+                critical_ttl,
+                telemetry_ttl,
             )
             .await
         })
@@ -630,7 +636,12 @@ async fn run_session_worker(
 
                 let payload = recv_buf[..len].to_vec();
                 let lane = classify_lane(&payload, &telemetry_prefixes);
-                let packet = DownstreamPacket { client_addr, payload };
+                let packet = DownstreamPacket {
+                    client_addr,
+                    payload,
+                    lane,
+                    enqueued_at: Instant::now(),
+                };
 
                 let queue_result = enqueue_laned(
                     packet,
@@ -681,6 +692,7 @@ async fn run_session_worker(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_downstream_worker(
     client_socket: Arc<UdpSocket>,
     critical_rx: Receiver<DownstreamPacket>,
@@ -688,6 +700,8 @@ async fn run_downstream_worker(
     metrics: ProxyMetrics,
     shutdown: CancellationToken,
     batch_size: usize,
+    critical_ttl: Duration,
+    telemetry_ttl: Duration,
 ) {
     let mut egress_io = EgressIo::new(batch_size.max(1));
 
@@ -712,6 +726,34 @@ async fn run_downstream_worker(
 
         metrics.set_udp_queue_depth("upstream_to_client", "critical", critical_rx.len() as i64);
         metrics.set_udp_queue_depth("upstream_to_client", "telemetry", telemetry_rx.len() as i64);
+
+        if !critical_ttl.is_zero() || !telemetry_ttl.is_zero() {
+            let now = Instant::now();
+            batch.retain(|pkt| {
+                let ttl = match pkt.lane {
+                    TrafficLane::Critical => critical_ttl,
+                    TrafficLane::Telemetry => telemetry_ttl,
+                };
+                if ttl.is_zero() {
+                    return true;
+                }
+                if now.saturating_duration_since(pkt.enqueued_at) <= ttl {
+                    return true;
+                }
+
+                let reason = match pkt.lane {
+                    TrafficLane::Critical => "downstream_stale_critical",
+                    TrafficLane::Telemetry => "downstream_stale_telemetry",
+                };
+                metrics.record_udp_drop(reason);
+                metrics.record_drop(reason);
+                false
+            });
+        }
+
+        if batch.is_empty() {
+            continue;
+        }
 
         match egress_io.send(&client_socket, &batch, &metrics).await {
             Ok(sent) => {
@@ -750,10 +792,10 @@ async fn enqueue_laned<T>(
                 let _ = telemetry_tap_rx.try_recv();
                 match telemetry_tx.try_send(item) {
                     Ok(_) => QueueOutcome::DroppedOldestEnqueued {
-                        reason: "queue_full_telemetry",
+                        reason: "queue_full_telemetry_drop_oldest",
                     },
                     Err(TrySendError::Full(_)) => QueueOutcome::Dropped {
-                        reason: "queue_full_telemetry",
+                        reason: "queue_full_telemetry_drop",
                     },
                     Err(TrySendError::Disconnected(_)) => QueueOutcome::Disconnected,
                 }
@@ -764,7 +806,7 @@ async fn enqueue_laned<T>(
                 Ok(_) => QueueOutcome::Enqueued,
                 Err(TrySendError::Disconnected(_)) => QueueOutcome::Disconnected,
                 Err(TrySendError::Full(_)) => QueueOutcome::Dropped {
-                    reason: "queue_full_critical",
+                    reason: "queue_full_critical_drop_newest",
                 },
             },
             CriticalOverflowPolicy::DropOldest => match critical_tx.try_send(item) {
@@ -774,10 +816,10 @@ async fn enqueue_laned<T>(
                     let _ = critical_tap_rx.try_recv();
                     match critical_tx.try_send(item) {
                         Ok(_) => QueueOutcome::DroppedOldestEnqueued {
-                            reason: "queue_full_critical",
+                            reason: "queue_full_critical_drop_oldest",
                         },
                         Err(TrySendError::Full(_)) => QueueOutcome::Dropped {
-                            reason: "queue_full_critical",
+                            reason: "queue_full_critical_drop",
                         },
                         Err(TrySendError::Disconnected(_)) => QueueOutcome::Disconnected,
                     }
@@ -795,10 +837,10 @@ async fn enqueue_laned<T>(
                             let _ = critical_tap_rx.try_recv();
                             match critical_tx.try_send(item) {
                                 Ok(_) => QueueOutcome::DroppedOldestEnqueued {
-                                    reason: "queue_full_critical",
+                                    reason: "queue_full_critical_drop_oldest",
                                 },
                                 Err(TrySendError::Full(_)) => QueueOutcome::Dropped {
-                                    reason: "queue_full_critical",
+                                    reason: "queue_full_critical_drop",
                                 },
                                 Err(TrySendError::Disconnected(_)) => QueueOutcome::Disconnected,
                             }

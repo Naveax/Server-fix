@@ -43,6 +43,7 @@ ctest --test-dir build --output-on-failure
 - Queue/backpressure defaults in the templates are tuned for freshness under overload:
   - `[proxy].critical_overflow_policy = "drop_oldest"` (prefer newest control/state; avoid stale backlog).
   - Keep `[proxy].telemetry_queue_capacity` smaller than `[proxy].critical_queue_capacity` to prevent telemetry from consuming queue budget.
+  - Optional: downstream stale-drop TTLs (`[proxy].downstream_*_ttl_millis`) can prevent delivering very late packets during overload.
 - Anomaly controls: `[anomaly]` with `anomaly_threshold`, `client_sync_check`, and `model`.
 - Packet integrity controls: `[packet_validation]` with `strict_mode` and `require_checksum`.
 - MMR/smurf controls: `[mmr]` with `mmr_threshold = 0.8` and optional Torch model path.

@@ -613,6 +613,8 @@ fn proxy_config(
             critical_queue_capacity: Some(32),
             critical_overflow_policy: CriticalOverflowPolicy::DropOldest,
             critical_block_timeout_millis: 5,
+            downstream_telemetry_ttl_millis: 0,
+            downstream_critical_ttl_millis: 0,
             telemetry_prefixes: vec!["TELE:".to_string()],
         },
         rate_limit: RateLimitSection {
