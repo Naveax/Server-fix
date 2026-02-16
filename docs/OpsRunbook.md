@@ -28,6 +28,40 @@
 - Watch per-core saturation, softirq backlog, queue depth, and drop reasons as first-line capacity signals.
 - Tune conservatively and validate with staging load before production changes.
 
+## Validated Baseline (2026-02-16)
+- Goal: maximize stability under overload while preserving freshness.
+- Test profile:
+  - `scenario=compare`, `compare-order=alternate`
+  - `clients=8`, `duration=20s`, `warmup=3s`, `repeats=50`
+  - `telemetry-per-tick=80`, `server-max-packets-per-tick=50`
+  - `jitter=30ms`, `drop-rate=0.03`
+  - `proxy-workers=1`, `proxy-batch-size=32`
+  - upstream queue: `128 / 32 / 96` (total / telemetry / critical)
+  - critical overflow: `drop-oldest`
+  - downstream queue: `128 / 512` (telemetry / critical)
+
+### Recommended TTL
+- `downstream_telemetry_ttl_millis = 100`
+- `downstream_critical_ttl_millis = 250`
+
+### Why 250ms (critical TTL)?
+- Two final candidates were validated with the same 50-repeat profile:
+  - `ttl100/200`: `p99_min=-455`, `neg_p99=8/50`, `neg_p99_lt_200=1`
+  - `ttl100/250`: `p99_min=-167`, `neg_p99=8/50`, `neg_p99_lt_200=0`
+- `ttl100/250` substantially reduced catastrophic tail regressions (`<-200`) and is safer for production stability.
+
+### Reproduce
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\eos_sweep.ps1 `
+  -Repeats 20 -DurationSecs 20 -WarmupSecs 3 `
+  -ProxyBatchSizes 32 `
+  -DownstreamTelemetryCaps 128 `
+  -DownstreamCriticalCaps 512 `
+  -DownstreamTelemetryTtlMs 50,100 `
+  -DownstreamCriticalTtlMs 100,150,200,250 `
+  -OutCsv nx_eos_sim_sweep_ttl.csv
+```
+
 ## Out Of Scope
 - This runbook is for operator-owned and explicitly authorized infrastructure only.
 - It does not cover patching or controlling third-party ranked/matchmaking backends.
