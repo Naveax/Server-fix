@@ -1869,7 +1869,21 @@ fn parse_args() -> Result<SimArgs, String> {
         }
 
         let (k, v): (&str, String) = if let Some((k, v)) = raw.split_once('=') {
-            (k, v.to_string())
+            if v.is_empty() && raw.starts_with("--") {
+                let Some(next) = iter.next() else {
+                    return Err(format!(
+                        "invalid arg '{raw}'. expected a value after it (for example --key=value). use --help"
+                    ));
+                };
+                if next.starts_with("--") {
+                    return Err(format!(
+                        "invalid arg '{raw}'. expected a value after it, got '{next}'"
+                    ));
+                }
+                (k, next)
+            } else {
+                (k, v.to_string())
+            }
         } else if raw.starts_with("--") {
             let Some(next) = iter.next() else {
                 return Err(format!(
