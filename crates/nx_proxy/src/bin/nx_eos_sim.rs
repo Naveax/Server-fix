@@ -78,6 +78,8 @@ struct SimArgs {
     drop_rate: f64,
     proxy_workers: usize,
     proxy_batch_size: usize,
+    proxy_socket_recv_buffer_bytes: Option<usize>,
+    proxy_socket_send_buffer_bytes: Option<usize>,
     proxy_queue_capacity: usize,
     proxy_telemetry_queue_capacity: usize,
     proxy_critical_queue_capacity: usize,
@@ -650,9 +652,17 @@ fn render_csv(_args: &SimArgs, runs: &[RunRecord]) -> String {
 
 fn render_json(args: &SimArgs, runs: &[RunRecord]) -> String {
     let mut out = String::new();
+    let proxy_recv_buf_json = args
+        .proxy_socket_recv_buffer_bytes
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "null".to_string());
+    let proxy_send_buf_json = args
+        .proxy_socket_send_buffer_bytes
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "null".to_string());
     out.push('{');
     out.push_str(&format!(
-        "\"scenario\":\"{}\",\"compare_order\":\"{}\",\"warmup_secs\":{},\"repeats\":{},\"output\":\"{}\",\"proxy_workers\":{},\"proxy_batch_size\":{},\"runs\":[",
+        "\"scenario\":\"{}\",\"compare_order\":\"{}\",\"warmup_secs\":{},\"repeats\":{},\"output\":\"{}\",\"proxy_workers\":{},\"proxy_batch_size\":{},\"proxy_socket_recv_buffer_bytes\":{},\"proxy_socket_send_buffer_bytes\":{},\"runs\":[",
         scenario_label(args.scenario),
         compare_order_label(args.compare_order),
         args.warmup_secs,
@@ -660,6 +670,8 @@ fn render_json(args: &SimArgs, runs: &[RunRecord]) -> String {
         output_label(args.output),
         args.proxy_workers,
         args.proxy_batch_size,
+        proxy_recv_buf_json,
+        proxy_send_buf_json,
     ));
 
     for (idx, run) in runs.iter().enumerate() {
@@ -1358,8 +1370,8 @@ fn proxy_config(
             min_datagram_bytes: 1,
             max_datagram_bytes: 1400,
             drop_udp_fragments: true,
-            socket_recv_buffer_bytes: None,
-            socket_send_buffer_bytes: None,
+            socket_recv_buffer_bytes: args.proxy_socket_recv_buffer_bytes,
+            socket_send_buffer_bytes: args.proxy_socket_send_buffer_bytes,
             queue_capacity: args.proxy_queue_capacity,
             telemetry_queue_capacity: Some(args.proxy_telemetry_queue_capacity),
             critical_queue_capacity: Some(args.proxy_critical_queue_capacity),
@@ -1837,6 +1849,8 @@ fn parse_args() -> Result<SimArgs, String> {
     let mut drop_rate = DEFAULT_DROP_RATE;
     let mut proxy_workers = DEFAULT_PROXY_WORKERS;
     let mut proxy_batch_size = DEFAULT_PROXY_BATCH_SIZE;
+    let mut proxy_socket_recv_buffer_bytes: Option<usize> = None;
+    let mut proxy_socket_send_buffer_bytes: Option<usize> = None;
     let mut proxy_queue_capacity = DEFAULT_PROXY_QUEUE_CAPACITY;
     let mut proxy_telemetry_queue_capacity = DEFAULT_PROXY_TELEMETRY_QUEUE_CAPACITY;
     let mut proxy_critical_queue_capacity = DEFAULT_PROXY_CRITICAL_QUEUE_CAPACITY;
@@ -1847,20 +1861,35 @@ fn parse_args() -> Result<SimArgs, String> {
     let mut proxy_downstream_telemetry_ttl_millis = DEFAULT_PROXY_DOWNSTREAM_TELEMETRY_TTL_MILLIS;
     let mut proxy_downstream_critical_ttl_millis = DEFAULT_PROXY_DOWNSTREAM_CRITICAL_TTL_MILLIS;
 
-    for raw in env::args().skip(1) {
+    let mut iter = env::args().skip(1).peekable();
+    while let Some(raw) = iter.next() {
         if raw == "--help" || raw == "-h" {
             print_help();
             std::process::exit(0);
         }
 
-        let Some((k, v)) = raw.split_once('=') else {
+        let (k, v): (&str, String) = if let Some((k, v)) = raw.split_once('=') {
+            (k, v.to_string())
+        } else if raw.starts_with("--") {
+            let Some(next) = iter.next() else {
+                return Err(format!(
+                    "invalid arg '{raw}'. expected --key=value or --key value. use --help"
+                ));
+            };
+            if next.starts_with("--") {
+                return Err(format!(
+                    "invalid arg '{raw}'. expected a value after it, got '{next}'"
+                ));
+            }
+            (raw.as_str(), next)
+        } else {
             return Err(format!(
-                "invalid arg '{raw}'. expected --key=value. use --help"
+                "invalid arg '{raw}'. expected --key=value or --key value. use --help"
             ));
         };
         match k {
             "--scenario" => {
-                scenario = match v {
+                scenario = match v.as_str() {
                     "direct" => Scenario::Direct,
                     "proxied" => Scenario::Proxied,
                     "compare" => Scenario::Compare,
@@ -1872,7 +1901,7 @@ fn parse_args() -> Result<SimArgs, String> {
                 };
             }
             "--compare-order" => {
-                compare_order = match v {
+                compare_order = match v.as_str() {
                     "direct-first" => CompareOrder::DirectFirst,
                     "proxied-first" => CompareOrder::ProxiedFirst,
                     "alternate" => CompareOrder::Alternate,
@@ -1889,16 +1918,16 @@ fn parse_args() -> Result<SimArgs, String> {
                     .map_err(|err| format!("invalid --warmup-secs '{v}': {err}"))?;
             }
             "--autotune" => {
-                autotune = parse_bool(v).ok_or_else(|| {
+                autotune = parse_bool(&v).ok_or_else(|| {
                     format!("invalid --autotune '{v}', use true|false|on|off|1|0")
                 })?;
             }
             "--autotune-telemetry-caps" => {
-                autotune_telemetry_caps = parse_usize_csv(v)
+                autotune_telemetry_caps = parse_usize_csv(&v)
                     .map_err(|err| format!("invalid --autotune-telemetry-caps '{v}': {err}"))?;
             }
             "--autotune-critical-caps" => {
-                autotune_critical_caps = parse_usize_csv(v)
+                autotune_critical_caps = parse_usize_csv(&v)
                     .map_err(|err| format!("invalid --autotune-critical-caps '{v}': {err}"))?;
             }
             "--repeats" => {
@@ -1907,7 +1936,7 @@ fn parse_args() -> Result<SimArgs, String> {
                     .map_err(|err| format!("invalid --repeats '{v}': {err}"))?;
             }
             "--output" => {
-                output = match v {
+                output = match v.as_str() {
                     "text" => OutputFormat::Text,
                     "json" => OutputFormat::Json,
                     "csv" => OutputFormat::Csv,
@@ -1967,15 +1996,33 @@ fn parse_args() -> Result<SimArgs, String> {
                     .parse::<f64>()
                     .map_err(|err| format!("invalid --drop-rate '{v}': {err}"))?;
             }
-            "--proxy-workers" | "--proxy-worker-count" => {
+            "--proxy-workers" | "--proxy-worker-count" | "--workers" => {
                 proxy_workers = v
                     .parse::<usize>()
                     .map_err(|err| format!("invalid {k} '{v}': {err}"))?;
             }
-            "--proxy-batch-size" => {
+            "--proxy-batch-size" | "--batch" => {
                 proxy_batch_size = v
                     .parse::<usize>()
                     .map_err(|err| format!("invalid --proxy-batch-size '{v}': {err}"))?;
+            }
+            "--proxy-socket-recv-buffer-bytes" => {
+                let size = v.parse::<usize>().map_err(|err| {
+                    format!("invalid --proxy-socket-recv-buffer-bytes '{v}': {err}")
+                })?;
+                if size == 0 {
+                    return Err("--proxy-socket-recv-buffer-bytes must be > 0".to_string());
+                }
+                proxy_socket_recv_buffer_bytes = Some(size);
+            }
+            "--proxy-socket-send-buffer-bytes" => {
+                let size = v.parse::<usize>().map_err(|err| {
+                    format!("invalid --proxy-socket-send-buffer-bytes '{v}': {err}")
+                })?;
+                if size == 0 {
+                    return Err("--proxy-socket-send-buffer-bytes must be > 0".to_string());
+                }
+                proxy_socket_send_buffer_bytes = Some(size);
             }
             "--proxy-queue-capacity" => {
                 proxy_queue_capacity = v
@@ -2016,7 +2063,7 @@ fn parse_args() -> Result<SimArgs, String> {
             }
             "--proxy-critical-overflow" => {
                 proxy_critical_overflow_policy =
-                    parse_critical_overflow_policy(v).ok_or_else(|| {
+                    parse_critical_overflow_policy(&v).ok_or_else(|| {
                         format!(
                             "invalid --proxy-critical-overflow '{v}', use drop-newest|drop-oldest|block-with-timeout"
                         )
@@ -2110,6 +2157,8 @@ fn parse_args() -> Result<SimArgs, String> {
         drop_rate,
         proxy_workers,
         proxy_batch_size,
+        proxy_socket_recv_buffer_bytes,
+        proxy_socket_send_buffer_bytes,
         proxy_queue_capacity,
         proxy_telemetry_queue_capacity,
         proxy_critical_queue_capacity,
@@ -2148,7 +2197,11 @@ fn print_help() {
          \t--jitter-ms=30\n\
          \t--drop-rate=0.03\n\
          \t--proxy-workers=1\n\
+         \t--workers=1 (alias)\n\
          \t--proxy-batch-size=32\n\
+         \t--batch=32 (alias)\n\
+         \t--proxy-socket-recv-buffer-bytes=2097152 (optional)\n\
+         \t--proxy-socket-send-buffer-bytes=2097152 (optional)\n\
          \t--proxy-queue-capacity=96\n\
          \t--proxy-telemetry-queue-capacity=48\n\
          \t--proxy-critical-queue-capacity=64\n\

@@ -15,6 +15,8 @@ param(
   #   .\\scripts\\eos_sweep.ps1 -ProxyBatchSizes 32,64
   # behave the same.
   [string[]]$ProxyBatchSizes = @("32", "64"),
+  [string[]]$ProxySocketRecvBufferBytes = @("0"),
+  [string[]]$ProxySocketSendBufferBytes = @("0"),
 
   # Upstream (client->server) per-session queues.
   [int]$ProxyQueueCapacity = 128,
@@ -82,18 +84,24 @@ if ($WarmupSecs -ge $DurationSecs) {
 }
 
 $proxyBatchSizesI = Parse-IntList -Values $ProxyBatchSizes -Name "ProxyBatchSizes"
+$proxySockRecvI = Parse-IntList -Values $ProxySocketRecvBufferBytes -Name "ProxySocketRecvBufferBytes"
+$proxySockSendI = Parse-IntList -Values $ProxySocketSendBufferBytes -Name "ProxySocketSendBufferBytes"
 $downTeleCapsI = Parse-IntList -Values $DownstreamTelemetryCaps -Name "DownstreamTelemetryCaps"
 $downCritCapsI = Parse-IntList -Values $DownstreamCriticalCaps -Name "DownstreamCriticalCaps"
 $ttlTeleMsI = Parse-IntList -Values $DownstreamTelemetryTtlMs -Name "DownstreamTelemetryTtlMs"
 $ttlCritMsI = Parse-IntList -Values $DownstreamCriticalTtlMs -Name "DownstreamCriticalTtlMs"
 
 if ($proxyBatchSizesI.Count -eq 0) { throw "-ProxyBatchSizes must not be empty" }
+if ($proxySockRecvI.Count -eq 0) { throw "-ProxySocketRecvBufferBytes must not be empty" }
+if ($proxySockSendI.Count -eq 0) { throw "-ProxySocketSendBufferBytes must not be empty" }
 if ($downTeleCapsI.Count -eq 0) { throw "-DownstreamTelemetryCaps must not be empty" }
 if ($downCritCapsI.Count -eq 0) { throw "-DownstreamCriticalCaps must not be empty" }
 if ($ttlTeleMsI.Count -eq 0) { throw "-DownstreamTelemetryTtlMs must not be empty" }
 if ($ttlCritMsI.Count -eq 0) { throw "-DownstreamCriticalTtlMs must not be empty" }
 
 if ($proxyBatchSizesI | Where-Object { $_ -le 0 }) { throw "-ProxyBatchSizes must be > 0" }
+if ($proxySockRecvI | Where-Object { $_ -lt 0 }) { throw "-ProxySocketRecvBufferBytes must be >= 0" }
+if ($proxySockSendI | Where-Object { $_ -lt 0 }) { throw "-ProxySocketSendBufferBytes must be >= 0" }
 if ($downTeleCapsI | Where-Object { $_ -le 0 }) { throw "-DownstreamTelemetryCaps must be > 0" }
 if ($downCritCapsI | Where-Object { $_ -le 0 }) { throw "-DownstreamCriticalCaps must be > 0" }
 if ($ttlTeleMsI | Where-Object { $_ -lt 0 }) { throw "-DownstreamTelemetryTtlMs must be >= 0" }
@@ -120,10 +128,17 @@ function Invoke-Sim {
     [int]$DownTele,
     [int]$DownCrit,
     [int]$TtlTele,
-    [int]$TtlCrit
+    [int]$TtlCrit,
+    [int]$SockRecvBytes,
+    [int]$SockSendBytes
   )
 
-  $name = "nx_eos_sim_sweep_b${BatchSize}_dq${DownTele}_${DownCrit}_ttl${TtlTele}_${TtlCrit}.json"
+  $sockTag = if ($SockRecvBytes -gt 0 -or $SockSendBytes -gt 0) {
+    "_sock${SockRecvBytes}_${SockSendBytes}"
+  } else {
+    ""
+  }
+  $name = "nx_eos_sim_sweep_b${BatchSize}_dq${DownTele}_${DownCrit}_ttl${TtlTele}_${TtlCrit}${sockTag}.json"
   $outPath = Join-Path $outDirPath $name
 
   $args = @(
@@ -156,7 +171,14 @@ function Invoke-Sim {
     "--output-path=$outPath"
   )
 
-  Write-Host "Running: batch=$BatchSize downQ=($DownTele,$DownCrit) ttl=($TtlTele,$TtlCrit)"
+  if ($SockRecvBytes -gt 0) {
+    $args += "--proxy-socket-recv-buffer-bytes=$SockRecvBytes"
+  }
+  if ($SockSendBytes -gt 0) {
+    $args += "--proxy-socket-send-buffer-bytes=$SockSendBytes"
+  }
+
+  Write-Host "Running: batch=$BatchSize downQ=($DownTele,$DownCrit) ttl=($TtlTele,$TtlCrit) sock=($SockRecvBytes,$SockSendBytes)"
   & $exe @args | Out-Host
 
   $j = Get-Content $outPath -Raw | ConvertFrom-Json
@@ -171,6 +193,8 @@ function Invoke-Sim {
     down_crit       = $DownCrit
     ttl_tele_ms     = $TtlTele
     ttl_crit_ms     = $TtlCrit
+    sock_recv_bytes = $SockRecvBytes
+    sock_send_bytes = $SockSendBytes
 
     avg_mean        = [double]$j.summary.delta_control_lag_avg.mean
     p99_mean        = [double]$j.summary.delta_control_lag_p99.mean
@@ -185,9 +209,20 @@ $rows = @()
 foreach ($batch in $proxyBatchSizesI) {
   foreach ($dqT in $downTeleCapsI) {
     foreach ($dqC in $downCritCapsI) {
-      foreach ($ttlT in $ttlTeleMsI) {
-        foreach ($ttlC in $ttlCritMsI) {
-          $rows += Invoke-Sim -BatchSize $batch -DownTele $dqT -DownCrit $dqC -TtlTele $ttlT -TtlCrit $ttlC
+      foreach ($sockR in $proxySockRecvI) {
+        foreach ($sockS in $proxySockSendI) {
+          foreach ($ttlT in $ttlTeleMsI) {
+            foreach ($ttlC in $ttlCritMsI) {
+              $rows += Invoke-Sim `
+                -BatchSize $batch `
+                -DownTele $dqT `
+                -DownCrit $dqC `
+                -TtlTele $ttlT `
+                -TtlCrit $ttlC `
+                -SockRecvBytes $sockR `
+                -SockSendBytes $sockS
+            }
+          }
         }
       }
     }
