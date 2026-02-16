@@ -187,13 +187,18 @@ pub async fn run_proxy(config: ProxyConfig, shutdown: CancellationToken) -> Resu
     let mut workers = JoinSet::new();
 
     for worker_id in 0..config.proxy.worker_count {
-        let socket = bind_worker_socket(config.proxy.listen_addr, config.proxy.reuse_port)
-            .with_context(|| {
-                format!(
-                    "failed to bind worker {worker_id} socket on {}",
-                    config.proxy.listen_addr
-                )
-            })?;
+        let socket = bind_worker_socket(
+            config.proxy.listen_addr,
+            config.proxy.reuse_port,
+            config.proxy.socket_recv_buffer_bytes,
+            config.proxy.socket_send_buffer_bytes,
+        )
+        .with_context(|| {
+            format!(
+                "failed to bind worker {worker_id} socket on {}",
+                config.proxy.listen_addr
+            )
+        })?;
 
         let worker_cfg = config.clone();
         let worker_metrics = metrics.clone();
@@ -442,6 +447,8 @@ async fn run_worker(
                             metrics.clone(),
                             shutdown.child_token(),
                             config.proxy.max_datagram_bytes,
+                            config.proxy.socket_recv_buffer_bytes,
+                            config.proxy.socket_send_buffer_bytes,
                         )
                             .await
                         {
@@ -534,6 +541,8 @@ async fn spawn_session(
     metrics: ProxyMetrics,
     shutdown: CancellationToken,
     max_datagram_bytes: usize,
+    socket_recv_buffer_bytes: Option<usize>,
+    socket_send_buffer_bytes: Option<usize>,
 ) -> Result<SessionHandle> {
     let bind_addr = match upstream_addr {
         SocketAddr::V4(_) => "0.0.0.0:0",
@@ -546,9 +555,12 @@ async fn spawn_session(
         .next()
         .context("no bind address resolved")?;
 
-    let upstream_socket = UdpSocket::bind(bind_addr)
-        .await
-        .context("failed to bind upstream session socket")?;
+    let upstream_socket = bind_session_socket(
+        bind_addr,
+        socket_recv_buffer_bytes,
+        socket_send_buffer_bytes,
+    )
+    .context("failed to bind upstream session socket")?;
     upstream_socket
         .connect(upstream_addr)
         .await
@@ -947,7 +959,12 @@ async fn recv_prioritized<T: Send + 'static>(
     }
 }
 
-fn bind_worker_socket(listen_addr: SocketAddr, reuse_port: bool) -> Result<UdpSocket> {
+fn bind_worker_socket(
+    listen_addr: SocketAddr,
+    reuse_port: bool,
+    recv_buffer_bytes: Option<usize>,
+    send_buffer_bytes: Option<usize>,
+) -> Result<UdpSocket> {
     let domain = if listen_addr.is_ipv4() {
         Domain::IPV4
     } else {
@@ -955,6 +972,7 @@ fn bind_worker_socket(listen_addr: SocketAddr, reuse_port: bool) -> Result<UdpSo
     };
     let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))
         .context("failed creating UDP socket")?;
+    apply_socket_buffer_tuning(&socket, recv_buffer_bytes, send_buffer_bytes)?;
     socket
         .set_reuse_address(true)
         .context("failed setting SO_REUSEADDR")?;
@@ -980,6 +998,48 @@ fn bind_worker_socket(listen_addr: SocketAddr, reuse_port: bool) -> Result<UdpSo
 
     let std_socket: std::net::UdpSocket = socket.into();
     UdpSocket::from_std(std_socket).context("failed converting socket into tokio UdpSocket")
+}
+
+fn bind_session_socket(
+    bind_addr: SocketAddr,
+    recv_buffer_bytes: Option<usize>,
+    send_buffer_bytes: Option<usize>,
+) -> Result<UdpSocket> {
+    let domain = if bind_addr.is_ipv4() {
+        Domain::IPV4
+    } else {
+        Domain::IPV6
+    };
+    let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))
+        .context("failed creating UDP socket")?;
+    apply_socket_buffer_tuning(&socket, recv_buffer_bytes, send_buffer_bytes)?;
+    socket
+        .bind(&bind_addr.into())
+        .with_context(|| format!("failed binding UDP socket to {bind_addr}"))?;
+    socket
+        .set_nonblocking(true)
+        .context("failed setting nonblocking mode")?;
+
+    let std_socket: std::net::UdpSocket = socket.into();
+    UdpSocket::from_std(std_socket).context("failed converting socket into tokio UdpSocket")
+}
+
+fn apply_socket_buffer_tuning(
+    socket: &Socket,
+    recv_buffer_bytes: Option<usize>,
+    send_buffer_bytes: Option<usize>,
+) -> Result<()> {
+    if let Some(size) = recv_buffer_bytes {
+        socket
+            .set_recv_buffer_size(size)
+            .with_context(|| format!("failed setting SO_RCVBUF={size}"))?;
+    }
+    if let Some(size) = send_buffer_bytes {
+        socket
+            .set_send_buffer_size(size)
+            .with_context(|| format!("failed setting SO_SNDBUF={size}"))?;
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]

@@ -9,6 +9,9 @@ max_sessions = 65536
 min_datagram_bytes = 1
 max_datagram_bytes = 1400
 drop_udp_fragments = true
+# Optional socket buffer tuning (bytes). Kernel may clamp requested values.
+socket_recv_buffer_bytes = 4194304
+socket_send_buffer_bytes = 4194304
 # best-effort: exact fragment detection may not be available via standard UDP socket APIs
 queue_capacity = 128
 telemetry_queue_capacity = 32

@@ -42,6 +42,14 @@ pub struct ProxySection {
     pub max_datagram_bytes: usize,
     #[serde(default = "default_true")]
     pub drop_udp_fragments: bool,
+    /// Optional socket receive buffer override in bytes (SO_RCVBUF).
+    /// If unset, OS defaults are used.
+    #[serde(default)]
+    pub socket_recv_buffer_bytes: Option<usize>,
+    /// Optional socket send buffer override in bytes (SO_SNDBUF).
+    /// If unset, OS defaults are used.
+    #[serde(default)]
+    pub socket_send_buffer_bytes: Option<usize>,
     #[serde(default = "default_legacy_queue_capacity")]
     pub queue_capacity: usize,
     #[serde(default)]
@@ -567,6 +575,12 @@ impl ProxyConfig {
         if self.proxy.min_datagram_bytes > self.proxy.max_datagram_bytes {
             bail!("proxy.min_datagram_bytes must be <= proxy.max_datagram_bytes");
         }
+        if matches!(self.proxy.socket_recv_buffer_bytes, Some(0)) {
+            bail!("proxy.socket_recv_buffer_bytes must be > 0 when set");
+        }
+        if matches!(self.proxy.socket_send_buffer_bytes, Some(0)) {
+            bail!("proxy.socket_send_buffer_bytes must be > 0 when set");
+        }
         if self.proxy.queue_capacity == 0 {
             bail!("proxy.queue_capacity must be > 0");
         }
@@ -717,6 +731,8 @@ batch_size = 32
 max_sessions = 4096
 min_datagram_bytes = 4
 max_datagram_bytes = 1400
+socket_recv_buffer_bytes = 1048576
+socket_send_buffer_bytes = 1048576
 queue_capacity = 64
 telemetry_queue_capacity = 32
 critical_queue_capacity = 16
@@ -796,6 +812,8 @@ listen_addr = "127.0.0.1:9200"
         let parsed = ProxyConfig::from_toml(good_config()).expect("config should parse");
         assert_eq!(parsed.proxy.worker_count, 2);
         assert_eq!(parsed.proxy.max_sessions, 4096);
+        assert_eq!(parsed.proxy.socket_recv_buffer_bytes, Some(1_048_576));
+        assert_eq!(parsed.proxy.socket_send_buffer_bytes, Some(1_048_576));
         assert_eq!(parsed.proxy.telemetry_queue_capacity(), 32);
         assert_eq!(parsed.proxy.critical_queue_capacity(), 16);
         assert_eq!(parsed.proxy.downstream_telemetry_queue_capacity(), 32);
@@ -830,6 +848,32 @@ listen_addr = "127.0.0.1:9200"
         let err = ProxyConfig::from_toml(&cfg).expect_err("should fail validation");
         assert!(
             err.to_string().contains("min_datagram_bytes"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn reject_zero_socket_recv_buffer_when_set() {
+        let cfg = good_config().replace(
+            "socket_recv_buffer_bytes = 1048576",
+            "socket_recv_buffer_bytes = 0",
+        );
+        let err = ProxyConfig::from_toml(&cfg).expect_err("should fail validation");
+        assert!(
+            err.to_string().contains("socket_recv_buffer_bytes"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn reject_zero_socket_send_buffer_when_set() {
+        let cfg = good_config().replace(
+            "socket_send_buffer_bytes = 1048576",
+            "socket_send_buffer_bytes = 0",
+        );
+        let err = ProxyConfig::from_toml(&cfg).expect_err("should fail validation");
+        assert!(
+            err.to_string().contains("socket_send_buffer_bytes"),
             "unexpected error: {err}"
         );
     }

@@ -44,6 +44,9 @@ ctest --test-dir build --output-on-failure
   - `[proxy].critical_overflow_policy = "drop_oldest"` (prefer newest control/state; avoid stale backlog).
   - Keep `[proxy].telemetry_queue_capacity` smaller than `[proxy].critical_queue_capacity` to prevent telemetry from consuming queue budget.
   - Optional: downstream stale-drop TTLs (`[proxy].downstream_*_ttl_millis`) can prevent delivering very late packets during overload.
+- Optional socket buffer tuning:
+  - `[proxy].socket_recv_buffer_bytes` and `[proxy].socket_send_buffer_bytes` tune `SO_RCVBUF` / `SO_SNDBUF` for worker and per-session upstream sockets.
+  - Use powers-of-two sized values (for example `2097152` or `4194304`) and verify effective values at OS level, since kernels can clamp.
 - Anomaly controls: `[anomaly]` with `anomaly_threshold`, `client_sync_check`, and `model`.
 - Packet integrity controls: `[packet_validation]` with `strict_mode` and `require_checksum`.
 - MMR/smurf controls: `[mmr]` with `mmr_threshold = 0.8` and optional Torch model path.
@@ -80,6 +83,19 @@ cargo run -p nx_proxy --release --features torch_train_full,cuda_anomaly --bin t
 - anomaly latency/drop metrics
 - packet validation latency/drop ratio
 - MMR detector latency/drop ratio
+
+## Metrics Dashboard Quick Start
+Enable metrics in config and scrape `GET /metrics` from `[metrics].listen_addr`.
+
+Useful PromQL starters:
+- UDP packet drop ratio:
+  - `sum(rate(nx_proxy_udp_dropped_total[1m])) / clamp_min(sum(rate(nx_proxy_udp_pkts_in_total[1m])), 1)`
+- Queue pressure by lane:
+  - `max(nx_proxy_udp_queue_depth{direction="upstream_to_client"}) by (lane)`
+- Rate-limit pressure:
+  - `sum(rate(nx_proxy_udp_rate_limited_total[1m])) by (scope)`
+- Top drop reasons:
+  - `topk(8, sum(rate(nx_proxy_udp_dropped_total[5m])) by (reason))`
 
 ## Security Note
 Use this project only on systems and networks you own or are explicitly authorized to operate.

@@ -1358,6 +1358,8 @@ fn proxy_config(
             min_datagram_bytes: 1,
             max_datagram_bytes: 1400,
             drop_udp_fragments: true,
+            socket_recv_buffer_bytes: None,
+            socket_send_buffer_bytes: None,
             queue_capacity: args.proxy_queue_capacity,
             telemetry_queue_capacity: Some(args.proxy_telemetry_queue_capacity),
             critical_queue_capacity: Some(args.proxy_critical_queue_capacity),

@@ -302,6 +302,8 @@ fn base_config(
             min_datagram_bytes: 1,
             max_datagram_bytes: 1400,
             drop_udp_fragments: true,
+            socket_recv_buffer_bytes: None,
+            socket_send_buffer_bytes: None,
             queue_capacity: 16,
             telemetry_queue_capacity: Some(8),
             critical_queue_capacity: Some(8),
