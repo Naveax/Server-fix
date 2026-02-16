@@ -1,4 +1,4 @@
-# RocketLeagueServerFix
+# ServerFix
 
 Defensive UDP edge mitigation layer and guard components for operator-owned game server deployments.
 
